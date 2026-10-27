@@ -1,0 +1,13 @@
+# Android
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+captures/
+*.apk
+*.keystore
+# PC
+live_position.json
+live_position.json.tmp
+__pycache__/

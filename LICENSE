@@ -1,0 +1,48 @@
+BeamNG.Earth Live GPS License
+Copyright (c) 2026 [YOUR NAME / GITHUB USERNAME]. All rights reserved.
+
+This license applies to all files in this repository ("the Software"), including source code, compiled
+builds (APK files) and documentation.
+
+1. PERMITTED
+   You may, free of charge:
+   a) download, install and use the Software for personal, non-commercial purposes;
+   b) modify the Software for your own personal use, as long as you do not distribute the modified version;
+   c) submit contributions (issues, pull requests) to this repository. By submitting a contribution you agree
+      that it may be included in the Software under this license;
+   d) show the Software in screenshots, videos and live streams, provided you give credit as set out in
+      section 3;
+   e) share links to this repository or its official release page.
+
+2. NOT PERMITTED WITHOUT PRIOR WRITTEN PERMISSION OF THE COPYRIGHT HOLDER
+   a) redistributing the Software or any part of it, modified or unmodified, including re-uploads, mirrors,
+      inclusion in mod packs, app stores or other download sites;
+   b) publishing modified versions, forks outside of GitHub's own fork feature, or derivative works;
+   c) any commercial use, including selling the Software, bundling it with paid products or placing it
+      behind a paywall;
+   d) removing or altering this license or any copyright or credit notices;
+   e) sublicensing.
+
+3. ATTRIBUTION
+   Wherever the Software is shown or mentioned publicly (for example in a video, stream, post or article),
+   you must credit the author by name and include a link to the original repository:
+       "BeamNG.Earth Live GPS by [YOUR NAME / GITHUB USERNAME] – https://github.com/[YOUR GITHUB USERNAME]/BeamNG.Earth-LiveGPS"
+
+4. PERMISSION REQUESTS
+   Requests for permission under section 2 can be made by opening an issue in this repository or by
+   contacting the copyright holder directly.
+
+5. THIRD-PARTY SOFTWARE
+   BeamNG.Earth is a separate project by TecnaGamer under its own license. BeamNG.drive is a product of
+   BeamNG GmbH. This Software is not affiliated with either. Gradle wrapper files are distributed under the
+   Apache License 2.0.
+
+6. TERMINATION
+   Any use in breach of this license automatically terminates your rights under it.
+
+7. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+   LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+   EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE. USE OF MOCK LOCATIONS IS AT YOUR OWN RISK.
