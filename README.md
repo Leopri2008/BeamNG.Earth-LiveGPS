@@ -4,9 +4,7 @@ Drive in [BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth), and your **
 as if you were really driving there. Open Google Maps, Waze or any navigation app on your phone and watch it track
 your in-game drive on the real-world map.
 
-<!-- Screenshot: put your image at docs/screenshot.png and remove the comment markers
-![BeamNG.Earth Live GPS](docs/screenshot.png)
--->
+
 
 **No changes to BeamNG.Earth** (neither the mod nor the server EXE). It only listens in on the position updates
 the mod already sends to its server.
@@ -33,9 +31,9 @@ heading in between so the map moves smoothly.
 ## Requirements
 
 - BeamNG.drive with BeamNG.Earth installed and working
-- Python 3.8+ on the PC (no extra packages)
+- Python 3.8+ on the PC
 - An Android phone (8.0+) on the **same Wi-Fi** as the PC
-- iPhone is not supported (iOS does not allow mock locations)
+- iPhone is not supported
 
 ## Setup
 
@@ -54,8 +52,7 @@ You can also open `http://127.0.0.1:47700/` in a browser, or read `live_position
 
 ### 2. Phone
 
-1. Download `BNE-Mock-GPS.apk` from the [Releases](../../releases) page (or from the latest
-   [Actions](../../actions) run) and install it. Or build it yourself: open `android/` in Android Studio and press ▶.
+1. Download `BNE-Mock-GPS.apk` from the [Releases](../../releases) page and install it. 
 2. Enable **Developer options** (Settings → About phone → tap *Build number* 7×).
 3. Developer options → **Select mock location app** → **BNE Mock GPS**
    (the app has a button that opens developer options).
@@ -77,7 +74,6 @@ You can also open `http://127.0.0.1:47700/` in a browser, or read `live_position
 
 - Some apps and games detect mock locations. Games like Pokémon GO ban accounts for it, so don't use it there.
 - The HTTP endpoint is reachable by anyone on your local network (read-only, position only).
-- The release APK is a debug build (signed with a debug key), which is fine for sideloading.
 
 ## Credits
 
@@ -91,7 +87,7 @@ Re-uploading, redistributing modified or unmodified copies, and commercial use a
 written permission. Please share a link to this repository instead. Full terms: [LICENSE](LICENSE).
 
 If you show it in a video or stream, please credit:
-`BeamNG.Earth Live GPS by [YOUR NAME / GITHUB USERNAME] – https://github.com/[YOUR GITHUB USERNAME]/BeamNG.Earth-LiveGPS`
+`BeamNG.Earth Live GPS by Leopri2009 – https://github.com/Leopri2008/BeamNG.Earth-LiveGPS`
 
 ---
 
