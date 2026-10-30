@@ -11,8 +11,8 @@ android {
         applicationId = "de.bne.mock"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
     buildTypes {
         release { isMinifyEnabled = false }
@@ -26,4 +26,5 @@ android {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("com.google.android.gms:play-services-location:21.3.0")   // Google Maps fix (fused location mock)
 }

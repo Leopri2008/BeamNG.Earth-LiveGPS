@@ -1,5 +1,6 @@
 package de.bne.mock
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -16,6 +17,10 @@ import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -62,6 +67,10 @@ class MockService : Service() {
     private val providers = mutableListOf<String>()
     private var threads = listOf<Thread>()
 
+    // Google Play services location (used by Google Maps). Without feeding it directly, Maps mixes our
+    // mock GPS with Google's own Wi-Fi/cell location and the position and speed jump around.
+    @Volatile private var fused: FusedLocationProviderClient? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -89,6 +98,7 @@ class MockService : Service() {
             Thread({ pollLoop("http://$host/") }, "poll"),
             Thread({ pushLoop() }, "push")
         )
+        setupFused()
         threads.forEach { it.start() }
         return START_STICKY
     }
@@ -221,9 +231,34 @@ class MockService : Service() {
     /** Sleeps; false when the service interrupts the thread on stop. */
     private fun nap(ms: Long): Boolean = try { Thread.sleep(ms); running } catch (_: InterruptedException) { false }
 
+    /** Puts Google's fused location provider into mock mode. Skipped on devices without Play services. */
+    @SuppressLint("MissingPermission")
+    private fun setupFused() {
+        try {
+            if (GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(this) != ConnectionResult.SUCCESS) return
+            val client = LocationServices.getFusedLocationProviderClient(this)
+            client.setMockMode(true).addOnFailureListener { fused = null }
+            fused = client
+        } catch (_: Throwable) {
+            fused = null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun push(lat: Double, lon: Double, speed: Float, bearing: Float) {
+        fused?.let { client ->
+            try { client.setMockLocation(makeLocation("fused", lat, lon, speed, bearing)) } catch (_: Throwable) {}
+        }
         for (p in providers) {
-            val loc = Location(p).apply {
+            val loc = makeLocation(p, lat, lon, speed, bearing)
+            try { lm.setTestProviderLocation(p, loc) } catch (e: Exception) {
+                setState(State.ERROR, "Could not set mock location: ${e.message}")
+            }
+        }
+    }
+
+    private fun makeLocation(provider: String, lat: Double, lon: Double, speed: Float, bearing: Float) =
+            Location(provider).apply {
                 latitude = lat
                 longitude = lon
                 this.speed = speed
@@ -237,15 +272,13 @@ class MockService : Service() {
                     verticalAccuracyMeters = 5f
                 }
             }
-            try { lm.setTestProviderLocation(p, loc) } catch (e: Exception) {
-                setState(State.ERROR, "Could not set mock location: ${e.message}")
-            }
-        }
-    }
 
+    @SuppressLint("MissingPermission")
     override fun onDestroy() {
         running = false
         threads.forEach { it.interrupt() }
+        fused?.let { try { it.setMockMode(false) } catch (_: Throwable) {} }
+        fused = null
         if (::lm.isInitialized) for (p in providers) {
             try { lm.setTestProviderEnabled(p, false) } catch (_: Exception) {}
             try { lm.removeTestProvider(p) } catch (_: Exception) {}

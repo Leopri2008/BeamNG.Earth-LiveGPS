@@ -124,6 +124,8 @@ class MainActivity : Activity() {
         conn.addView(mainButton, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, dp(52)
         ))
+        conn.addView(button("Open live map", card, accent, outline = true) { openLiveMap() },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(46)).apply { topMargin = dp(10) })
         root.addView(conn, cardParams())
 
         // Setup help
@@ -192,6 +194,17 @@ class MainActivity : Activity() {
         hostField.clearFocus()
         val i = Intent(this, MockService::class.java).putExtra(MockService.EXTRA_HOST, host)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+    }
+
+    private fun openLiveMap() {
+        val host = hostField.text.toString().trim().removePrefix("http://").removeSuffix("/")
+        if (host.isEmpty()) {
+            Toast.makeText(this, "Enter the PC address first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        prefs.edit().putString("host", host).apply()
+        // in-app map: the screen stays on (a browser tab over Wi-Fi can't guarantee that)
+        startActivity(Intent(this, MapActivity::class.java).putExtra(MapActivity.EXTRA_URL, "http://$host/map"))
     }
 
     private fun openDevOptions() {
