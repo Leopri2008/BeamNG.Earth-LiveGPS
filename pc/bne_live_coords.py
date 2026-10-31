@@ -7,6 +7,11 @@ Reads the live position of your car in BeamNG.Earth without changing the mod or 
 The mod sends a 'pose' message to its server about twice per second, which already contains the car's
 real latitude/longitude and speed. This relay passes everything through unchanged and listens in.
 
+The script also records your drive (works with the browser closed):
+  - the driven route, kept across restarts until you reset it (export as GPX or KML)
+  - trip stats (distance, drive time, average and top speed)
+  - a lifetime odometer: only real driving counts, never teleports or glitches
+
 Usage:
   1. Start the BeamNG.Earth server (EXE) as usual (listens on 127.0.0.1:47613).
   2. Run this script:  python bne_live_coords.py
@@ -15,11 +20,13 @@ Usage:
   4. Live data is available in:
        - this console
        - live_position.json  (next to this script, rewritten on every pose)
-       - http://<PC-IP>:47700/      (JSON, reachable on your Wi-Fi, used by the BNE Mock GPS app)
-       - http://<PC-IP>:47700/map   (live map in any browser: iPhone, iPad, Android, PC, OBS)
+       - http://<PC-IP>:47700/            (JSON, reachable on your Wi-Fi, used by the BNE Mock GPS app)
+       - http://<PC-IP>:47700/map         (live map in any browser: iPhone, iPad, Android, PC, OBS)
+       - http://<PC-IP>:47700/export.gpx  (driven route as GPX; /export.kml for Google Earth)
 
 Part of BeamNG.Earth Live GPS. See LICENSE for terms.
 """
+import atexit
 import json
 import math
 import os
@@ -27,15 +34,22 @@ import socket
 import struct
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from xml.sax.saxutils import escape
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 LISTEN_PORT = 47614       # the game connects here (-bngeport 47614)
 SERVER_PORT = 47613       # the BeamNG.Earth server listens here (default)
 HTTP_PORT = 47700         # JSON endpoint for the phone app / your own tools
-OUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_position.json")
-MAX_FRAME = 16 * 1024 * 1024
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUT_FILE = os.path.join(SCRIPT_DIR, "live_position.json")
+DATA_DIR = os.path.join(SCRIPT_DIR, "BNE_LiveGPS_data")   # route + stats, kept across restarts
+TRACK_FILE = os.path.join(DATA_DIR, "track.ndjson")
+STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+MAX_FRAME = 64 * 1024 * 1024   # same limit as the mod (framing.lua)
 
 DEBUG = True              # show which message types the game sends, until the first pose arrives
 
@@ -44,27 +58,309 @@ seen = {}
 lock = threading.Lock()
 
 
+# ===================================================================== drive recorder
+#
+# Every pose is checked against the last accepted one before it moves the live position, the route or any counter:
+#   - DRIVING: the distance fits the car's own speed  -> route + trip + odometer
+#   - JUMP:    it doesn't fit (teleport, glitch, the world reloading). The new place is only taken once several poses
+#              in a row agree on it (CONFIRM_N); a single pose somewhere else (e.g. a flash to the map's zero point)
+#              is thrown away. A confirmed jump starts a new route segment (no line through the world) and counts
+#              nothing.
+# Speeds only count for the top speed when the car's position really moved that fast.
+
+R_EARTH = 6371008.8
+CONFIRM_N = 3              # poses (~1.5 s) that must agree before a jump is believed
+MAX_ACCEL = 40.0           # m/s^2 (~4 g): faster speed changes are glitches
+JUMP_CHAIN_SPEED = 400.0   # m/s: poses of one confirmed jump must be this close to each other
+RESUME_GAP_S = 10.0        # longer without poses (game closed, paused, script restarted) = resume, count nothing
+RESUME_JOIN_M = 30.0       # after a gap, continue the same route segment if the car is still this close
+POINT_MIN_M = 5.0          # route resolution
+SAVE_EVERY_S = 5.0
+
+
+def dist_m(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R_EARTH * math.asin(min(1.0, math.sqrt(a)))
+
+
+def iso(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Recorder:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.track_id = uuid.uuid4().hex[:12]
+        self.points = []           # [lat, lon, t, speed_ms, seg]
+        self.seg = 0
+        self.trip = {"dist_m": 0.0, "moving_s": 0.0, "max_ms": 0.0, "started": time.time()}
+        self.odo_m = 0.0
+        self.last = None           # last accepted pose: dict(lat, lon, t, v)
+        self.pending = []          # poses of an unconfirmed jump
+        self.open_seg = False      # True once the current segment has a stored point
+        self.dirty = False
+        self.saved_at = 0.0
+        self.glitches = 0
+        self.prev_vok = 0.0
+        self._load()
+
+    # ------------------------------------------------------------------ storage
+    def _load(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        try:
+            with open(STATS_FILE, encoding="utf-8") as f:
+                s = json.load(f)
+            self.odo_m = float(s.get("odo_m", 0.0))
+            self.trip.update({k: float(s["trip"][k]) for k in ("dist_m", "moving_s", "max_ms", "started")
+                              if k in s.get("trip", {})})
+            self.track_id = s.get("track_id") or self.track_id
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        try:
+            with open(TRACK_FILE, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue           # a line cut off by a crash
+                    if isinstance(row, dict):
+                        if row.get("id"):
+                            self.track_id = row["id"]
+                    elif isinstance(row, list) and len(row) >= 5:
+                        self.points.append(row[:5])
+        except OSError:
+            self._write_header()
+        if self.points:
+            self.seg = int(self.points[-1][4])
+            la, lo, t, v, _ = self.points[-1]
+            self.last = {"lat": la, "lon": lo, "t": t, "v": 0.0}   # continue from here (after a gap)
+            self.open_seg = True
+
+    def _write_header(self):
+        try:
+            with open(TRACK_FILE, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"id": self.track_id, "created": time.time()}) + "\n")
+        except OSError:
+            pass
+
+    def _append_point(self, row):
+        self.points.append(row)
+        try:
+            with open(TRACK_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+
+    def save(self, force=False):
+        now = time.time()
+        if not (self.dirty or force) or (not force and now - self.saved_at < SAVE_EVERY_S):
+            return
+        data = {"version": VERSION, "track_id": self.track_id, "odo_m": round(self.odo_m, 2),
+                "trip": {k: round(v, 3) for k, v in self.trip.items()}}
+        try:
+            tmp = STATS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, STATS_FILE)
+            self.dirty, self.saved_at = False, now
+        except OSError:
+            pass
+
+    def reset_trip(self):
+        with self.lock:
+            self.track_id = uuid.uuid4().hex[:12]
+            self.points = []
+            self.seg += 1
+            self.open_seg = False
+            self.trip = {"dist_m": 0.0, "moving_s": 0.0, "max_ms": 0.0, "started": time.time()}
+            self._write_header()
+            self.dirty = True
+            self.save(force=True)
+
+    # ------------------------------------------------------------------ route points
+    def _store(self, lat, lon, t, v, force=False):
+        if self.points and self.open_seg and not force:
+            p = self.points[-1]
+            if p[4] == self.seg and dist_m(p[0], p[1], lat, lon) < POINT_MIN_M:
+                return
+        self._append_point([round(lat, 7), round(lon, 7), round(t, 1), round(v, 2), self.seg])
+        self.open_seg = True
+
+    def _new_segment(self):
+        self.seg += 1
+        self.open_seg = False
+
+    # ------------------------------------------------------------------ the filter
+    def feed(self, lat, lon, speed, now):
+        """Returns 'drive', 'jump', 'resume', 'pending' or 'drop'. Only 'drive', 'jump' and 'resume' move the car."""
+        if lat is None or lon is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            return "drop"
+        if abs(lat) < 1e-6 and abs(lon) < 1e-6:          # null island: never a real place in BeamNG.Earth
+            self.glitches += 1
+            return "drop"
+        speed = max(0.0, float(speed or 0.0))
+        with self.lock:
+            a = self.last
+            if a is None:
+                return self._jump_candidate(lat, lon, speed, now, first=True)
+            dt = max(0.05, now - a["t"])
+            d = dist_m(a["lat"], a["lon"], lat, lon)
+
+            if dt > RESUME_GAP_S:                       # back after a pause / restart / next day
+                if d <= RESUME_JOIN_M:
+                    self.pending = []
+                    self._accept(lat, lon, now, min(speed, 1.0))
+                    return "resume"
+                return self._jump_candidate(lat, lon, speed, now)
+
+            v_cap = a["v"] + MAX_ACCEL * dt + 3.0           # the most the speed can have grown
+            v_new = speed if speed <= v_cap else a["v"]     # a spike: keep the last good speed
+            allowed = max(a["v"], v_new) * dt * 1.5 + 4.0
+            if d <= allowed:
+                self.pending = []
+                v_pos = d / dt
+                moving = speed > 0.3 and v_pos > 0.3
+                if moving:
+                    self.trip["dist_m"] += d
+                    self.odo_m += d
+                    self.trip["moving_s"] += min(dt, 5.0)
+                    # top speed: only what the position confirms, held for two poses in a row (~1 s):
+                    # a spike in the speed value alone, or in a single pose, never counts
+                    v_ok = min(v_new, v_pos * 1.1 + 1.0)
+                    held = min(v_ok, self.prev_vok)
+                    self.prev_vok = v_ok
+                    if held > self.trip["max_ms"]:
+                        self.trip["max_ms"] = held
+                    self.dirty = True
+                if not moving:
+                    self.prev_vok = 0.0
+                self._accept(lat, lon, now, v_new)
+                if moving or not self.open_seg:
+                    self._store(lat, lon, now, v_new)
+                return "drive"
+            return self._jump_candidate(lat, lon, speed, now)
+
+    def _accept(self, lat, lon, now, v):
+        if self.last is None or now - self.last["t"] > RESUME_GAP_S:
+            self.prev_vok = 0.0
+        self.last = {"lat": lat, "lon": lon, "t": now, "v": v}
+
+    def _jump_candidate(self, lat, lon, speed, now, first=False):
+        p = {"lat": lat, "lon": lon, "t": now, "v": speed}
+        if self.pending:
+            q = self.pending[-1]
+            dt = max(0.05, now - q["t"])
+            if dist_m(q["lat"], q["lon"], lat, lon) > JUMP_CHAIN_SPEED * dt + 20.0:
+                self.pending = []                  # the jump poses don't agree with each other: start over
+        self.pending.append(p)
+        if len(self.pending) < CONFIRM_N:
+            return "pending"
+        # confirmed: a real teleport (or a new start). New route segment, nothing counted.
+        self.pending = []
+        self._new_segment()
+        self.prev_vok = 0.0
+        self._accept(lat, lon, now, min(speed, 5.0))
+        self._store(lat, lon, now, 0.0, force=True)
+        return "jump"
+
+    # ------------------------------------------------------------------ views
+    def summary(self):
+        t = self.trip
+        return {
+            "track_id": self.track_id, "track_n": len(self.points), "seg": self.seg,
+            "trip": {"dist_m": round(t["dist_m"], 1), "moving_s": round(t["moving_s"], 1),
+                     "max_ms": round(t["max_ms"], 2), "started": t["started"]},
+            "odo_m": round(self.odo_m, 1),
+        }
+
+    def track_since(self, since, track_id):
+        with self.lock:
+            if track_id != self.track_id or since < 0 or since > len(self.points):
+                since = 0
+            pts = [[p[0], p[1], p[4]] for p in self.points[since:]]
+            return {"id": self.track_id, "from": since, "n": len(self.points), "seg": self.seg, "pts": pts}
+
+    def segments(self):
+        with self.lock:
+            segs, cur, cur_id = [], [], None
+            for p in self.points:
+                if p[4] != cur_id:
+                    if len(cur) > 1:
+                        segs.append(cur)
+                    cur, cur_id = [], p[4]
+                cur.append(p)
+            if len(cur) > 1:
+                segs.append(cur)
+            return segs
+
+    def gpx(self):
+        out = ['<?xml version="1.0" encoding="UTF-8"?>',
+               '<gpx version="1.1" creator="BeamNG.Earth Live GPS by Leopri2008" '
+               'xmlns="http://www.topografix.com/GPX/1/1">',
+               f'<metadata><name>BeamNG.Earth drive</name><time>{iso(time.time())}</time></metadata>',
+               '<trk><name>BeamNG.Earth drive</name>']
+        for seg in self.segments():
+            out.append("<trkseg>")
+            for la, lo, t, v, _ in seg:
+                out.append(f'<trkpt lat="{la:.7f}" lon="{lo:.7f}"><time>{iso(t)}</time></trkpt>')
+            out.append("</trkseg>")
+        out.append("</trk></gpx>")
+        return "\n".join(out)
+
+    def kml(self):
+        s = self.summary()
+        desc = (f"Distance {s['trip']['dist_m'] / 1000:.1f} km, top speed {s['trip']['max_ms'] * 3.6:.0f} km/h. "
+                "Recorded with BeamNG.Earth Live GPS by Leopri2008.")
+        out = ['<?xml version="1.0" encoding="UTF-8"?>',
+               '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>',
+               '<name>BeamNG.Earth drive</name>',
+               f'<description>{escape(desc)}</description>',
+               '<Style id="route"><LineStyle><color>ff1a7aff</color><width>4</width></LineStyle></Style>']
+        for i, seg in enumerate(self.segments(), 1):
+            coords = " ".join(f"{lo:.7f},{la:.7f},0" for la, lo, t, v, _ in seg)
+            out.append(f'<Placemark><name>Part {i} ({iso(seg[0][2])})</name><styleUrl>#route</styleUrl>'
+                       f'<LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString>'
+                       '</Placemark>')
+        out.append("</Document></kml>")
+        return "\n".join(out)
+
+
+rec = None   # created in main()
+
+
 def handle_pose(msg):
     global DEBUG
     DEBUG = False
+    now = time.time()
+    result = rec.feed(msg.get("lat"), msg.get("lon"), msg.get("speed"), now)
+    if result in ("pending", "drop"):
+        return                                   # not believed (yet): the live position stays where it was
     vx, vy = msg.get("vx") or 0.0, msg.get("vy") or 0.0     # m/s in the local frame: x = east, y = north
+    with rec.lock:
+        speed = rec.last["v"]          # the checked speed (spikes replaced by the last good value)
+        info = rec.summary()
+    if result == "jump":
+        vx = vy = 0.0
     pos = {
         "lat": msg.get("lat"),
         "lon": msg.get("lon"),
-        "speed_kmh": round((msg.get("speed") or 0) * 3.6, 1),
-        "speed_ms": msg.get("speed") or 0.0,
+        "speed_kmh": round(speed * 3.6, 1),
+        "speed_ms": speed,
         "ve": vx,
         "vn": vy,
         "bearing": (math.degrees(math.atan2(vx, vy)) + 360.0) % 360.0,
         "z_local": msg.get("z"),
         "anchorId": msg.get("anchorId"),
-        "t": time.time(),
+        "t": now,
+        "event": result,
     }
-    if pos["lat"] is None:
-        return
+    pos.update(info)
     with lock:
         latest.clear()
         latest.update(pos)
+    rec.save()
     try:
         tmp = OUT_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -72,8 +368,9 @@ def handle_pose(msg):
         os.replace(tmp, OUT_FILE)
     except OSError:
         pass
-    print(f"\r  LIVE  {pos['lat']:.6f}, {pos['lon']:.6f}   {pos['speed_kmh']:6.1f} km/h   "
-          f"{pos['bearing']:5.1f} deg   ", end="", flush=True)
+    print(f"\r  LIVE  {pos['lat']:.6f}, {pos['lon']:.6f}  {pos['speed_kmh']:6.1f} km/h  |  "
+          f"trip {info['trip']['dist_m'] / 1000:7.2f} km  |  total {info['odo_m'] / 1000:9.2f} km   ",
+          end="", flush=True)
 
 
 def pipe(src, dst, inspect):
@@ -96,6 +393,10 @@ def pipe(src, dst, inspect):
                     break
                 payload = bytes(buf[4:4 + n])
                 del buf[:4 + n]
+                if b'"pose"' not in payload:  # cheap skip of the big non-pose messages
+                    if DEBUG:
+                        seen["other"] = seen.get("other", 0) + 1
+                    continue
                 try:
                     msg = json.loads(payload)   # field order from Lua is random -> always parse fully
                 except ValueError:
@@ -103,7 +404,10 @@ def pipe(src, dst, inspect):
                 t = msg.get("type") if isinstance(msg, dict) else None
                 seen[t] = seen.get(t, 0) + 1
                 if t == "pose":
-                    handle_pose(msg)
+                    try:
+                        handle_pose(msg)
+                    except Exception as e:      # never let a bad pose break the relay
+                        print(f"\n  [warn] pose skipped: {e}", flush=True)
                 elif DEBUG:
                     print(f"\n  [debug] messages from the game so far: {seen}", flush=True)
     except OSError:
@@ -141,6 +445,14 @@ def serve_relay():
 
 
 class Http(BaseHTTPRequestHandler):
+    def _q(self):
+        q = {}
+        if "?" in self.path:
+            for part in self.path.split("?", 1)[1].split("&"):
+                k, _, v = part.partition("=")
+                q[k] = v
+        return q
+
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/", "/pos"):
@@ -148,18 +460,53 @@ class Http(BaseHTTPRequestHandler):
                 data = dict(latest)
             if "t" in data:
                 data["age"] = round(time.time() - data["t"], 3)   # seconds since the last pose
+            else:
+                with rec.lock:
+                    data.update(rec.summary())                     # stats even before the first pose
             self._send(200, "application/json", json.dumps(data).encode())
+        elif path == "/track":
+            q = self._q()
+            try:
+                since = int(q.get("since", "0"))
+            except ValueError:
+                since = 0
+            self._send(200, "application/json",
+                       json.dumps(rec.track_since(since, q.get("id", "")), separators=(",", ":")).encode())
+        elif path == "/stats":
+            with rec.lock:
+                self._send(200, "application/json", json.dumps(rec.summary()).encode())
+        elif path in ("/export.gpx", "/export.kml"):
+            kind = path[-3:]
+            body = (rec.gpx() if kind == "gpx" else rec.kml()).encode("utf-8")
+            name = "beamng-earth-drive-" + datetime.now().strftime("%Y%m%d-%H%M") + "." + kind
+            ctype = "application/gpx+xml" if kind == "gpx" else "application/vnd.google-earth.kml+xml"
+            self._send(200, ctype, body, {"Content-Disposition": f'attachment; filename="{name}"'})
         elif path == "/map":
             self._send(200, "text/html; charset=utf-8", MAP_HTML.encode("utf-8"))
         else:
             self._send(404, "text/plain", b"Not found. Try /map for the live map.")
 
-    def _send(self, code, ctype, body):
+    def do_POST(self):
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/reset":
+            rec.reset_trip()
+            print("\n  Trip and route reset (odometer kept).", flush=True)
+            with rec.lock:
+                info = rec.summary()
+            with lock:
+                latest.update(info)
+            self._send(200, "application/json", json.dumps(info).encode())
+        else:
+            self._send(404, "text/plain", b"Not found")
+
+    def _send(self, code, ctype, body, headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -287,8 +634,9 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 #needle { width: 52%; height: 52%; transition: transform .25s linear; }
 #hdg { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 
-#stats { flex: 1; min-width: 0; max-width: 560px; padding: 12px 8px 12px 16px; display: flex; align-items: center; gap: 4px; }
-.stat-grid { flex: 1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px 12px; }
+#stats { flex: 1; min-width: 0; max-width: 680px; padding: 12px 8px 12px 16px; display: flex; align-items: center; gap: 4px; }
+.stat-grid { flex: 1; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px 12px; }
+.stat.odo { border-left: 1px solid var(--line); padding-left: 12px; }
 .stat { min-width: 0; }
 .stat b { display: block; font-size: clamp(16px, 2.6vmin, 22px); font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stat span { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; font-weight: 650; }
@@ -347,6 +695,12 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .btn { height: 44px; padding: 0 16px; border-radius: 12px; font-weight: 650; font-size: 14px; border: 1.5px solid var(--line); }
 .btn:hover { border-color: rgba(255,255,255,.25); }
 .btn.warn { color: var(--bad); border-color: rgba(255,92,92,.35); }
+a.btn { display: inline-flex; align-items: center; text-decoration: none; color: var(--text); }
+.btn.armed, .icon-btn.armed { background: var(--bad); color: #fff; border-color: var(--bad); }
+.odo-box { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; margin-bottom: 10px; background: rgba(255,255,255,.03); }
+.odo-box span { display: block; font-size: 12px; color: var(--muted); }
+.odo-box b { display: block; font-size: 28px; font-weight: 750; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; margin: 2px 0; }
+.odo-box small { display: block; font-size: 11.5px; color: var(--muted); }
 .btns { display: flex; flex-wrap: wrap; gap: 8px; }
 .note { font-size: 12.5px; color: var(--muted); line-height: 1.5; margin: 8px 2px 0; }
 .note code { color: var(--text); font-size: 12px; background: rgba(255,255,255,.06); padding: 1px 6px; border-radius: 6px; word-break: break-all; }
@@ -370,6 +724,10 @@ kbd { font-family: inherit; font-size: 11px; border: 1px solid var(--line); bord
 @keyframes hintIn { from { opacity: 0; transform: translateX(-50%) translateY(-6px); } to { opacity: 1; transform: translateX(-50%); } }
 @keyframes hintPulse { 0%,100% { box-shadow: var(--shadow), 0 0 0 0 rgba(255,122,26,.35); } 50% { box-shadow: var(--shadow), 0 0 0 7px rgba(255,122,26,0); } }
 body.obs #awakeHint { display: none !important; }
+@media (max-width: 520px) {
+  #awakeHint { left: var(--edge-l); transform: none; white-space: normal; text-align: left;
+    max-width: calc(100vw - var(--edge-l) - var(--edge-r) - var(--ctl) - 26px); animation: hintPulse 2.4s ease-in-out infinite; }
+}
 #toast {
   position: absolute; z-index: 6; left: 50%; top: calc(var(--edge-t) + 104px); transform: translateX(-50%);
   padding: 10px 16px; border-radius: 999px; font-size: 13.5px; font-weight: 600; pointer-events: none;
@@ -402,6 +760,8 @@ body.obs #awakeHint { display: none !important; }
   #stats { max-width: none; padding: 10px 6px 10px 14px; }
   .stat b { font-size: 16px; }
   .stat span { font-size: 9.5px; }
+  .stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .stat.odo { border-left: 0; padding-left: 0; }
 }
 @media (max-width: 380px) {
   #coords { display: none; }
@@ -471,6 +831,7 @@ body.obs.obs-stats #stats { display: flex !important; }
       <div class="stat"><b id="stTime">0:00</b><span>Drive time</span></div>
       <div class="stat"><b id="stAvg">0</b><span>Avg</span></div>
       <div class="stat"><b id="stMax">0</b><span>Max</span></div>
+      <div class="stat odo"><b id="stOdo">0 km</b><span>Total</span></div>
     </div>
     <button class="icon-btn" id="btnReset" title="Reset trip" aria-label="Reset trip">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
@@ -516,8 +877,16 @@ body.obs.obs-stats #stats { display: flex !important; }
     </div>
   </div>
 
-  <div class="sec"><h3>Trip</h3>
-    <div class="btns"><button class="btn warn" id="btnReset2">Reset trip &amp; route</button></div>
+  <div class="sec"><h3>Trip &amp; route</h3>
+    <div class="odo-box"><span>Total driven with Live GPS</span><b id="odoBig">0 km</b>
+      <small>Only real driving counts: teleports and glitches are never added.</small></div>
+    <p class="note" id="tripInfo"></p>
+    <div class="btns">
+      <a class="btn" id="expGpx" href="/export.gpx" download>Export GPX</a>
+      <a class="btn" id="expKml" href="/export.kml" download>Export KML</a>
+      <button class="btn warn" id="btnReset2">Reset trip &amp; route</button>
+    </div>
+    <p class="note">The route and trip are recorded by the script on your PC, also while this page is closed, and kept until you reset them. GPX works in most GPS apps and Strava-like tools, KML opens in Google Earth.</p>
   </div>
 
   <div class="sec"><h3>Tips</h3>
@@ -547,9 +916,8 @@ body.obs.obs-stats #stats { display: flex !important; }
   const CAMS = ["north", "heading", "chase"];
   const POLL_MS = 250;
   const STALE_S = 5;
-  const TELEPORT_MPS = 150;          // faster than this between two samples = teleport, not driving
-  const TRAIL_MIN_M = 6;
-  const TRAIL_MAX_PTS = 60000;
+  const SNAP_GAP_MS = 2500;           // longer without a new position (page in the background, ...): jump, don't glide
+  const JOIN_MAX_M = 400;            // connect the route's last point to the car only if it's this close
   const BLD_DARK = "#5b616b", BLD_LIGHT = "#ddd6cb";   // neutral grey in dark styles
   const SRC_TRAIL = "bne-trail", LYR_TRAIL = "bne-trail-line", LYR_TRAIL_GLOW = "bne-trail-glow", LYR_BLD = "bne-3d-buildings";
 
@@ -611,13 +979,60 @@ body.obs.obs-stats #stats { display: flex !important; }
     stale: false,
     hasFix: false,
   };
-  const trip = { dist: 0, time: 0, moving: 0, max: 0, prev: null, prevAt: 0 };
-  const trail = { segs: [[]], count: 0, dirty: false, lastPush: 0 };
+  // trip stats, odometer and the route all come from the script on the PC (it records with this page closed too)
+  const trip = { dist: 0, moving: 0, max: 0, odo: 0 };
+  const trail = { id: null, n: 0, segs: [], segIds: [], dirty: false, loading: false, seg: null };
 
-  function resetTrip() {
-    trip.dist = trip.time = trip.moving = trip.max = 0; trip.prev = null;
-    trail.segs = [[]]; trail.count = 0; trail.dirty = true;
-    renderStats(); toast("Trip reset");
+  async function loadTrack(full) {
+    if (trail.loading) return;
+    trail.loading = true;
+    try {
+      const since = full ? 0 : trail.n;
+      const r = await fetch(`/track?since=${since}&id=${encodeURIComponent(trail.id || "")}&_=${Date.now()}`, { cache: "no-store" });
+      const j = await r.json();
+      if (j.from === 0 || j.id !== trail.id) { trail.segs = []; trail.segIds = []; }
+      for (const [la, lo, sg] of j.pts) {
+        if (trail.segIds[trail.segIds.length - 1] !== sg) { trail.segs.push([]); trail.segIds.push(sg); }
+        trail.segs[trail.segs.length - 1].push([lo, la]);
+      }
+      trail.id = j.id; trail.n = j.n; trail.dirty = true;
+    } catch (e) {
+    } finally { trail.loading = false; }
+  }
+
+  // reset needs two taps (so a stray tap never wipes a long drive)
+  let resetArmed = 0;
+  async function resetTrip(btn) {
+    const now = Date.now();
+    if (now - resetArmed > 3000) {
+      resetArmed = now;
+      for (const b of [$("btnReset"), $("btnReset2")]) b.classList.add("armed");
+      if (btn && btn.id === "btnReset2") btn.textContent = "Tap again to reset";
+      toast("Tap again to reset trip & route");
+      setTimeout(disarmReset, 3000);
+      return;
+    }
+    disarmReset();
+    try {
+      const r = await fetch("/reset", { method: "POST" });
+      applySummary(await r.json());
+      trail.segs = []; trail.segIds = []; trail.n = 0; trail.dirty = true;
+      await loadTrack(true);
+      toast("Trip & route reset (total km kept)");
+    } catch (e) { toast("Reset failed: PC script not reachable"); }
+  }
+  function disarmReset() {
+    resetArmed = 0;
+    for (const b of [$("btnReset"), $("btnReset2")]) b.classList.remove("armed");
+    $("btnReset2").textContent = "Reset trip & route";
+  }
+
+  function applySummary(j) {
+    if (!j) return;
+    if (j.trip) { trip.dist = +j.trip.dist_m || 0; trip.moving = +j.trip.moving_s || 0; trip.max = +j.trip.max_ms || 0; }
+    if (typeof j.odo_m === "number") trip.odo = j.odo_m;
+    if (j.track_id && (j.track_id !== trail.id || j.track_n > trail.n)) loadTrack(j.track_id !== trail.id);
+    else if (j.track_id && j.track_n < trail.n) loadTrack(true);
   }
 
   // ---------------------------------------------------------------- polling the PC script
@@ -628,6 +1043,7 @@ body.obs.obs-stats #stats { display: flex !important; }
       const r = await fetch("/?_=" + Date.now(), { cache: "no-store", signal: ctrl.signal });
       const j = await r.json();
       st.fails = 0;
+      applySummary(j);
       if (j && typeof j.lat === "number" && typeof j.lon === "number") onSample(j);
       else if (!st.hasFix) setStatus("waiting");
     } catch (e) {
@@ -638,6 +1054,7 @@ body.obs.obs-stats #stats { display: flex !important; }
     }
   }
 
+  let lastSampleAt = 0;
   function onSample(j) {
     const age = typeof j.age === "number" ? j.age : 0;
     st.stale = age > STALE_S;
@@ -652,34 +1069,28 @@ body.obs.obs-stats #stats { display: flex !important; }
     };
     const p = [s.lng, s.lat];
 
-    // trip stats + teleport detection (on real samples, not on the smoothed position)
-    let teleport = false;
-    if (trip.prev) {
-      const d = dist(trip.prev, p), dt = Math.max(0.05, (s.at - trip.prevAt) / 1000);
-      teleport = d / dt > TELEPORT_MPS && d > 300;
-      if (!teleport && dt < 10) {
-        trip.dist += d; trip.time += dt;
-        if (s.speed > 0.5) trip.moving += dt;
-      }
-    }
-    trip.max = Math.max(trip.max, s.speed);
-    trip.prev = p; trip.prevAt = s.at;
+    // jump instead of glide when: the script saw a teleport (new route segment), or this page was in the
+    // background / lost samples for a while (the car is somewhere else by now)
+    const teleport = j.event === "jump" || (trail.seg !== null && j.seg !== trail.seg);
+    const gap = now - lastSampleAt > SNAP_GAP_MS || document.hidden;
+    const snap = teleport || gap || !st.hasFix;
+    trail.seg = j.seg; lastSampleAt = now;
 
-    // smoothing: keep the on-screen position and fade the correction out, unless it was a teleport
-    const predicted = st.disp;
     st.sample = s;
-    if (predicted && !teleport) {
+    if (st.disp && !snap) {
       const tgt = predict(s, now);
-      st.off = [predicted[0] - tgt[0], predicted[1] - tgt[1]];
+      st.off = [st.disp[0] - tgt[0], st.disp[1] - tgt[1]];
       st.offAt = now;
     } else {
       st.off = [0, 0];
+      st.disp = p;
+      if (st.hasFix && follow && !document.hidden) map.jumpTo({ center: p });
     }
-    if (teleport || !st.hasFix) { st.disp = p; if (st.hasFix) newTrailSegment(); }
     if (s.speed > 1.0) st.bearing = s.bearing;
+    if (snap) st.dispBearing = st.bearing;
     st.speed = s.speed;
+    trail.dirty = true;
 
-    addTrailPoint(p, teleport);
     if (!st.hasFix) firstFix(p);
     st.hasFix = true;
   }
@@ -709,27 +1120,17 @@ body.obs.obs-stats #stats { display: flex !important; }
         : "Looking for the BeamNG.Earth Live GPS script on your PC.";
   }
 
-  // ---------------------------------------------------------------- trail
-  function newTrailSegment() { if (trail.segs[trail.segs.length - 1].length) trail.segs.push([]); }
-  function addTrailPoint(p, teleport) {
-    if (teleport) newTrailSegment();
-    const seg = trail.segs[trail.segs.length - 1];
-    const last = seg[seg.length - 1];
-    if (last && dist(last, p) < TRAIL_MIN_M) return;
-    seg.push(p); trail.count++; trail.dirty = true;
-    while (trail.count > TRAIL_MAX_PTS) {
-      const first = trail.segs[0]; first.shift(); trail.count--;
-      if (!first.length && trail.segs.length > 1) trail.segs.shift();
-    }
-  }
+  // ---------------------------------------------------------------- trail (route from the script)
   function trailGeoJSON() {
-    const lines = trail.segs.filter(s => s.length > 1).map(s => s.slice());
-    // connect the last recorded point to the live position so the line ends at the car
-    if (st.disp && trail.segs[trail.segs.length - 1].length) {
-      const cur = lines.length && lines[lines.length - 1];
-      const seg = trail.segs[trail.segs.length - 1];
-      if (cur && cur[cur.length - 1] === seg[seg.length - 1]) cur.push(st.disp);
-      else if (seg.length === 1) lines.push([seg[0], st.disp]);
+    const lines = trail.segs.filter(x => x.length > 1).map(x => x.slice());
+    // let the line end at the car: only within the same segment and when close (never across a teleport)
+    const last = trail.segs[trail.segs.length - 1];
+    if (st.disp && last && last.length && trail.segIds[trail.segIds.length - 1] === trail.seg) {
+      const end = last[last.length - 1];
+      if (dist(end, st.disp) < JOIN_MAX_M) {
+        if (last.length > 1) lines[lines.length - 1].push(st.disp);
+        else lines.push([end, st.disp]);
+      }
     }
     return { type: "Feature", properties: {}, geometry: { type: "MultiLineString", coordinates: lines } };
   }
@@ -1027,11 +1428,20 @@ body.obs.obs-stats #stats { display: flex !important; }
   }
   function renderStats() {
     $("stDist").textContent = distOut(trip.dist);
-    $("stTime").textContent = fmtTime(trip.time);
-    const avg = trip.moving > 1 ? Math.min(trip.dist / trip.moving, trip.max) : 0;
+    $("stTime").textContent = fmtTime(trip.moving);
+    const avg = trip.moving > 1 ? Math.min(trip.dist / trip.moving, trip.max || Infinity) : 0;
     $("stAvg").textContent = `${Math.round(spdOut(avg))} ${spdUnit()}`;
     $("stMax").textContent = `${Math.round(spdOut(trip.max))} ${spdUnit()}`;
+    $("stOdo").textContent = odoOut(trip.odo);
+    $("odoBig").textContent = odoOut(trip.odo, 1);
+    $("tripInfo").textContent = `Current trip: ${distOut(trip.dist)} · drive time ${fmtTime(trip.moving)} · top ${Math.round(spdOut(trip.max))} ${spdUnit()}`;
   }
+  function odoOut(m, dec) {
+    const v = imperial() ? m / 1609.344 : m / 1000;
+    const d = dec !== undefined ? dec : (v < 100 ? 1 : 0);
+    return v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }) + (imperial() ? " mi" : " km");
+  }
+
 
   // ---------------------------------------------------------------- controls
   const CAM_ICONS = {
@@ -1089,8 +1499,8 @@ body.obs.obs-stats #stats { display: flex !important; }
     };
   }
   $("spdBox").onclick = () => { S.units = imperial() ? "metric" : "imperial"; save(); renderSwitches(); renderHud(); toast(spdUnit()); };
-  $("btnReset").onclick = resetTrip;
-  $("btnReset2").onclick = resetTrip;
+  $("btnReset").onclick = e => resetTrip(e.currentTarget);
+  $("btnReset2").onclick = e => resetTrip(e.currentTarget);
 
   // copy coordinates (clipboard API needs HTTPS, so fall back for the Wi-Fi address)
   $("coords").onclick = () => {
@@ -1214,6 +1624,7 @@ body.obs.obs-stats #stats { display: flex !important; }
 """
 
 
+
 def lan_ip():
     """The PC's IP address on the local network (for the phone)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1227,6 +1638,9 @@ def lan_ip():
 
 
 def main():
+    global rec
+    rec = Recorder()
+    atexit.register(lambda: rec.save(force=True))
     try:
         http = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Http)
     except OSError as e:
@@ -1242,8 +1656,14 @@ def main():
     print(f"  Phone app address:  {ip}:{HTTP_PORT}")
     print(f"  Live map (browser): http://{ip}:{HTTP_PORT}/map")
     print(f"  Local JSON:         http://127.0.0.1:{HTTP_PORT}/")
-    print(f"  File:               {OUT_FILE}")
+    print(f"  Export route:       http://{ip}:{HTTP_PORT}/export.gpx  (or .kml)")
     print(f"  Relay:              game -> :{LISTEN_PORT} -> server :{SERVER_PORT}")
+    print(line)
+    t = rec.trip
+    print(f"  Total driven:       {rec.odo_m / 1000:.2f} km")
+    print(f"  Current trip:       {t['dist_m'] / 1000:.2f} km, {len(rec.points)} route points "
+          f"(reset it on the map: Settings > Reset trip)")
+    print(f"  Data folder:        {DATA_DIR}")
     print(line)
     serve_relay()
 
