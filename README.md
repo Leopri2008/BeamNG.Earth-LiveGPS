@@ -4,6 +4,10 @@ Drive in [BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth), and your **
 as if you were really driving there. Open Google Maps, Waze or any navigation app on your phone and watch it track
 your in-game drive on the real-world map.
 
+**Live map in your browser:** works on any device in your Wi-Fi, **including iPhone and iPad**, plus a stream overlay for OBS.
+
+**Drive recorder (v1.2):** the script records your route and trip even with the browser closed, keeps them until you
+reset them, exports them as **GPX or KML**, and keeps a lifetime **odometer** that only counts real driving.
 
 
 **No changes to BeamNG.Earth** (neither the mod nor the server EXE). It only listens in on the position updates
@@ -18,8 +22,8 @@ BeamNG.drive (BeamNG.Earth mod)
 pc/bne_live_coords.py  ──►  BeamNG.Earth server EXE (127.0.0.1:47613, unchanged)
         │  HTTP :47700 (your Wi-Fi)
         ▼
-Android app "BNE Mock GPS"  ──►  Android mock location (GPS / network / fused)
-        ▼
+Android app "BNE Mock GPS"  ──►  Android mock location (GPS / network / fused / Google Play services)
+        ▼                                         Live map in any browser: http://PC-IP:47700/map
 Google Maps, Waze, …
 ```
 
@@ -33,7 +37,7 @@ heading in between so the map moves smoothly.
 - BeamNG.drive with BeamNG.Earth installed and working
 - Python 3.8+ on the PC
 - An Android phone (8.0+) on the **same Wi-Fi** as the PC
-- iPhone is not supported
+- iPhone can't use the GPS mock (iOS does not allow mock locations), but the live map works
 
 ## Setup
 
@@ -42,9 +46,10 @@ heading in between so the map moves smoothly.
 1. Start the BeamNG.Earth server as usual.
 2. Run `python pc/bne_live_coords.py`
    It prints the address for the phone, e.g. `Phone app address:  192.168.178.20:47700`.
+   and the live map address, e.g. `Live map (browser): http://192.168.178.20:47700/map`.
    If Windows Firewall asks, allow access on **private networks**.
-3. Steam → BeamNG.drive → Properties → Launch options: `-bngeport 47614`
-4. Start BeamNG.drive and load BeamNG.Earth. The console shows `Game connected.` and then a `LIVE` line with your coordinates.
+4. Steam → BeamNG.drive → Properties → Launch options: `-bngeport 47614`
+5. Start BeamNG.drive and load BeamNG.Earth. The console shows `Game connected.` and then a `LIVE` line with your coordinates.
 
 To go back to normal, just remove the launch option.
 
@@ -60,6 +65,38 @@ You can also open `http://127.0.0.1:47700/` in a browser, or read `live_position
    The status turns green **LIVE** and shows your coordinates, speed and heading.
 5. Open your navigation app and drive.
 
+### 3. Live map (any device, including iPhone)
+
+Open the `Live map` address from the console in any browser on your Wi-Fi, e.g. `http://192.168.178.20:47700/map`
+(on the PC itself: `http://127.0.0.1:47700/map`). The Android app also has an **Open live map** button.
+
+- **Map styles:** Dark, Liberty, Bright, Positron, Fiord (free [OpenFreeMap](https://openfreemap.org) tiles, no account)
+- **Camera:** North up, Heading up, or **Chase 3D**, drag the map to look around, tap **Recenter** to follow again
+- **3D buildings**, auto zoom by speed, your driven route, live speed (km/h or mph) and compass
+- **Trip stats:** distance, drive time, average and top speed, plus your **total km** driven with Live GPS
+- - **Export** the route as GPX (GPS apps) or KML (Google Earth) in the settings, or open `http://PC-IP:47700/export.gpx` / `.kml`
+- Settings are remembered per browser. Desktop keys: `C` camera, `B` 3D, `S` style, `R` recenter, `F` fullscreen, `U` units
+
+**iPhone / iPad:** for full screen, tap Share → **Add to Home Screen** and open it from there.
+
+**Screen stays on:** on Android, open the map with the **Open live map** button in the app, which keeps the screen on reliably.
+In a browser the page tries to keep the screen on too (tap the map once after opening it), but over the Wi-Fi address
+browsers don't guarantee it. If it still turns off (e.g. iPhone), set Auto-Lock to "Never" while driving.
+
+**OBS overlay:** add a Browser Source with `http://127.0.0.1:47700/map?obs=1` (map + speedometer only).
+Options: `&stats=1` shows trip stats, `&style=liberty`, `&cam=heading`, `&units=imperial`, `&buildings=0`, `&trail=0`.
+
+### 4. Drive recorder
+
+The script records everything itself, so it also works while the map is closed or the phone is in your pocket:
+
+- **Route and trip** are saved in the folder `BNE_LiveGPS_data` next to the script and stays even at restarts.
+  continues where you stopped. Nothing is deleted until you tap **Reset trip & route** (twice, so it never happens by accident).
+- **Teleports never draw a line through the world:** a jump starts a new route part. Short glitches are ignored completely.
+- **Only real driving counts:** distance only adds up when the car's position moves the way its own speed says, and
+  the top speed only counts when the position confirms it for a second. Teleports, glitches and the free camera add nothing.
+- **Total km (odometer)** is never reset by the trip reset.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -69,12 +106,17 @@ You can also open `http://127.0.0.1:47700/` in a browser, or read `live_position
 | `Game connected.` but no coordinates | Load into the world and drive; poses are only sent once the world around you is loaded |
 | App shows ERROR `PC not reachable` | Same Wi-Fi? Correct IP? Firewall allowed on private networks? Test `http://PC-IP:47700/` in the phone's browser |
 | App shows ERROR `not selected as mock location app` | Developer options → Select mock location app → BNE Mock GPS |
+| Google Maps jumps around or shows wrong speed while navigating | Update to v1.1. If it still happens: Settings → Location → turn off *Google Location Accuracy* and Wi-Fi/Bluetooth scanning |
+| Live map stays grey or says "Map could not load" | The device needs internet for the map tiles; reload the page |
+| Live map says `PC script not reachable` | Script still running? Same Wi-Fi? Firewall allowed on private networks? |
 
 ## Notes
 
 - Some apps and games detect mock locations. Games like Pokémon GO ban accounts for it, so don't use it there.
 - The HTTP endpoint is reachable by anyone on your local network (read-only, position only).
-
+- - Your route and stats are stored only on your PC, in `BNE_LiveGPS_data` next to the script. Delete that folder to start completely fresh (this also resets the total km).
+- Map data © [OpenFreeMap](https://openfreemap.org), © [OpenMapTiles](https://www.openmaptiles.org/), data from [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors.
+  
 ## Credits
 
 - [BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth) by TecnaGamer. This is an unofficial companion tool,
@@ -87,7 +129,7 @@ Re-uploading, redistributing modified or unmodified copies, and commercial use a
 written permission. Please share a link to this repository instead. Full terms: [LICENSE](LICENSE).
 
 If you show it in a video or stream, please credit:
-`BeamNG.Earth Live GPS by Leopri2009 – https://github.com/Leopri2008/BeamNG.Earth-LiveGPS`
+`BeamNG.Earth Live GPS by Leopri2008 – https://github.com/Leopri2008/BeamNG.Earth-LiveGPS`
 
 ---
 
@@ -97,6 +139,9 @@ If you show it in a video or stream, please credit:
 2. In Steam bei BeamNG.drive die Startoption `-bngeport 47614` setzen und das Spiel starten.
 3. APK aus den Releases installieren, in den Entwickleroptionen als „App für Pseudo-Standorte" wählen.
 4. In der App die PC-Adresse aus der Konsole eintragen und auf START tippen. Handy und PC müssen im selben WLAN sein.
+5. Live-Karte (auch iPhone): die `Live map`-Adresse aus der Konsole im Browser öffnen, z. B. `http://192.168.178.20:47700/map`.
+6. Strecke, Trip und Gesamt-km zeichnet das Skript selbst auf (auch bei geschlossenem Browser) und speichert sie im Ordner `BNE_LiveGPS_data`. Export als GPX/KML und Reset in den Karten-Einstellungen.
 
 Lizenz: Alle Rechte vorbehalten. Private Nutzung ist frei, bei öffentlicher Vorstellung sind Credits Pflicht.
 Weiterverbreitung und kommerzielle Nutzung nur mit schriftlicher Erlaubnis. Details siehe [LICENSE](LICENSE).
+
