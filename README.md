@@ -9,6 +9,8 @@ your in-game drive on the real-world map.
 **Drive recorder (v1.2):** the script records your route and trip even with the browser closed, keeps them until you
 reset them, exports them as **GPX or KML**, and keeps a lifetime **odometer** that only counts real driving.
 
+**Fog of the world (v1.3):** the map is covered in a light mist. Every place you really drive through is revealed and stays
+revealed. Wrongly revealed cells can be erased again in an erase mode with a grid.
 
 **No changes to BeamNG.Earth** (neither the mod nor the server EXE). It only listens in on the position updates
 the mod already sends to its server.
@@ -74,7 +76,8 @@ Open the `Live map` address from the console in any browser on your Wi-Fi, e.g. 
 - **Camera:** North up, Heading up, or **Chase 3D**, drag the map to look around, tap **Recenter** to follow again
 - **3D buildings**, auto zoom by speed, your driven route, live speed (km/h or mph) and compass
 - **Trip stats:** distance, drive time, average and top speed, plus your **total km** driven with Live GPS
-- - **Export** the route as GPX (GPS apps) or KML (Google Earth) in the settings, or open `http://PC-IP:47700/export.gpx` / `.kml`
+- **Fog of the world:** see [section 5](#5-fog-of-the-world)
+- **Export** the route as GPX (GPS apps) or KML (Google Earth) in the settings, or open `http://PC-IP:47700/export.gpx` / `.kml`
 - Settings are remembered per browser. Desktop keys: `C` camera, `B` 3D, `S` style, `R` recenter, `F` fullscreen, `U` units
 
 **iPhone / iPad:** for full screen, tap Share → **Add to Home Screen** and open it from there.
@@ -96,6 +99,21 @@ The script records everything itself, so it also works while the map is closed o
 - **Only real driving counts:** distance only adds up when the car's position moves the way its own speed says, and
   the top speed only counts when the position confirms it for a second. Teleports, glitches and the free camera add nothing.
 - **Total km (odometer)** is never reset by the trip reset.
+
+### 5. Fog of the world
+
+The map is covered in a translucent mist. The map is divided into a grid of squares (about 25 m). Only the squares you
+really drive through are filled, and they stay filled, across restarts, until you reset them. The mist opens a little wider
+around them, with soft edges.
+
+- **Only real driving reveals:** it uses the same check as the odometer. Teleports, glitches and the free camera reveal nothing,
+  and the gap between two position updates is filled in, so fast driving leaves no holes.
+- **Erase mode** (Settings → Fog of the world → *Erase cells*): the mist is lifted and you see the grid. Revealed cells are
+  outlined in orange. Tap a cell to remove it (brush: 1 cell, 7×7 or 17×17), *Undo* brings it back, *Done* leaves the mode.
+  Zoom in a bit to edit, the grid appears at street level.
+- **Reset fog** (tap twice) clears everything. It is separate from *Reset trip & route* and from the odometer.
+- The mist can be switched off in the settings, or in the OBS overlay with `&fog=0`.
+- The explored cells are stored on your PC in `BNE_LiveGPS_data/fog.json`. The settings show how many km² you have explored.
 
 ## Troubleshooting
 
@@ -141,6 +159,7 @@ If you show it in a video or stream, please credit:
 4. In der App die PC-Adresse aus der Konsole eintragen und auf START tippen. Handy und PC müssen im selben WLAN sein.
 5. Live-Karte (auch iPhone): die `Live map`-Adresse aus der Konsole im Browser öffnen, z. B. `http://192.168.178.20:47700/map`.
 6. Strecke, Trip und Gesamt-km zeichnet das Skript selbst auf (auch bei geschlossenem Browser) und speichert sie im Ordner `BNE_LiveGPS_data`. Export als GPX/KML und Reset in den Karten-Einstellungen.
+7. Nebel der Welt: Orte, durch die du wirklich gefahren bist, werden aufgedeckt und bleiben es. Falsch aufgedeckte Felder lassen sich im Entfernen-Modus (Einstellungen → Fog of the world → *Erase cells*) wieder löschen. Das Skript prüft beim Start einmal, ob es ein Update gibt
 
 Lizenz: Alle Rechte vorbehalten. Private Nutzung ist frei, bei öffentlicher Vorstellung sind Credits Pflicht.
 Weiterverbreitung und kommerzielle Nutzung nur mit schriftlicher Erlaubnis. Details siehe [LICENSE](LICENSE).

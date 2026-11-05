@@ -11,6 +11,9 @@ The script also records your drive (works with the browser closed):
   - the driven route, kept across restarts until you reset it (export as GPX or KML)
   - trip stats (distance, drive time, average and top speed)
   - a lifetime odometer: only real driving counts, never teleports or glitches
+  - the fog of the world: every place you really drove through is revealed on the map, kept until you reset it
+
+On start it looks once for a newer release on GitHub (start with --no-update-check to skip that).
 
 Usage:
   1. Start the BeamNG.Earth server (EXE) as usual (listens on 127.0.0.1:47613).
@@ -30,16 +33,19 @@ import atexit
 import json
 import math
 import os
+import re
 import socket
 import struct
+import sys
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 LISTEN_PORT = 47614       # the game connects here (-bngeport 47614)
 SERVER_PORT = 47613       # the BeamNG.Earth server listens here (default)
@@ -49,6 +55,7 @@ OUT_FILE = os.path.join(SCRIPT_DIR, "live_position.json")
 DATA_DIR = os.path.join(SCRIPT_DIR, "BNE_LiveGPS_data")   # route + stats, kept across restarts
 TRACK_FILE = os.path.join(DATA_DIR, "track.ndjson")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+FOG_FILE = os.path.join(DATA_DIR, "fog.json")
 MAX_FRAME = 64 * 1024 * 1024   # same limit as the mod (framing.lua)
 
 DEBUG = True              # show which message types the game sends, until the first pose arrives
@@ -76,6 +83,12 @@ RESUME_GAP_S = 10.0        # longer without poses (game closed, paused, script r
 RESUME_JOIN_M = 30.0       # after a gap, continue the same route segment if the car is still this close
 POINT_MIN_M = 5.0          # route resolution
 SAVE_EVERY_S = 5.0
+FOG_Z = 20                 # fog grid = Web Mercator tiles at zoom 20 (~25 m squares in Europe)
+FOG_N = 1 << FOG_Z
+FOG_MAX_EDIT = 50000       # cells per edit request
+FOG_REACH_M = 6.0          # a road along a cell edge fills both cells: cells within this distance of the car count as driven through
+REPO = "Leopri2008/BeamNG.Earth-LiveGPS"
+update_info = {}           # filled by check_update() when a newer release exists
 
 
 def dist_m(lat1, lon1, lat2, lon2):
@@ -327,6 +340,166 @@ class Recorder:
         return "\n".join(out)
 
 
+# ===================================================================== fog of the world
+class Fog:
+    """Explored map cells. A cell is explored only when REAL driving (the same check as the odometer) passes through it:
+    teleports and glitches reveal nothing. Cells are stored as x * FOG_N + y of a zoom-20 map tile."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cells = set()
+        self.order = []            # the same cells in the order they were added (map page syncs incrementally)
+        self.epoch = 1             # changes whenever cells are removed or restored: pages reload everything
+        self.area_m2 = 0.0
+        self.prev = None           # last revealed position, to fill the gap between two poses
+        self.dirty = False
+        self.saved_at = 0.0
+        self._area = {}
+        self._load()
+
+    @staticmethod
+    def _tile(lat, lon):
+        lat = max(-85.0511, min(85.0511, lat))
+        return ((lon + 180.0) / 360.0 * FOG_N,
+                (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * FOG_N)
+
+    def _cell_area(self, y):
+        a = self._area.get(y)
+        if a is None:
+            lat = math.atan(math.sinh(math.pi * (1 - 2 * (y + 0.5) / FOG_N)))
+            a = self._area[y] = (40075016.686 * math.cos(lat) / FOG_N) ** 2
+        return a
+
+    def _add(self, k):
+        if k not in self.cells:
+            self.cells.add(k)
+            self.order.append(k)
+            self.area_m2 += self._cell_area(k % FOG_N)
+
+    def _load(self):
+        try:
+            with open(FOG_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            z = data.get("z")
+            if not isinstance(z, int) or not 1 <= z <= FOG_Z:
+                z = FOG_Z
+            f = 1 << (FOG_Z - z)               # cells of an earlier build (coarser grid): each becomes f x f of today's
+            for k in data.get("cells", []):
+                if isinstance(k, int) and 0 <= k < (FOG_N // f) ** 2:
+                    x, y = divmod(k, FOG_N // f)
+                    for dx in range(f):
+                        for dy in range(f):
+                            self._add((x * f + dx) * FOG_N + y * f + dy)
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+
+    def save(self, force=False):
+        now = time.time()
+        if not (self.dirty or force) or (not force and now - self.saved_at < 10.0):
+            return
+        with self.lock:
+            data = {"z": FOG_Z, "cells": list(self.order)}
+            self.dirty = False
+        try:
+            tmp = FOG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, separators=(",", ":"))
+            os.replace(tmp, FOG_FILE)
+            self.saved_at = now
+        except OSError:
+            self.dirty = True
+
+    def cut(self):
+        """A teleport or a long pause: the next reveal must not be joined to the previous place."""
+        self.prev = None
+
+    def reveal(self, lat, lon):
+        with self.lock:
+            pts = [(lat, lon)]
+            if self.prev:
+                d = dist_m(self.prev[0], self.prev[1], lat, lon)
+                if d <= 300.0:             # fast driving: fill in between two poses, steps of at most half a cell
+                    n = int(d / (0.5 * math.sqrt(self._cell_area(int(self._tile(*self.prev)[1]))))) + 1
+                    pts = [(self.prev[0] + (lat - self.prev[0]) * i / n,
+                            self.prev[1] + (lon - self.prev[1]) * i / n) for i in range(1, n + 1)]
+            self.prev = (lat, lon)
+            before = len(self.order)
+            for la, lo in pts:
+                x, y = self._tile(la, lo)
+                r = FOG_REACH_M / math.sqrt(self._cell_area(int(y)))          # in cells
+                for i in range(math.floor(x - r), math.floor(x + r) + 1):
+                    for j in range(math.floor(y - r), math.floor(y + r) + 1):
+                        if 0 <= j < FOG_N:
+                            self._add((i % FOG_N) * FOG_N + j)
+            if len(self.order) != before:
+                self.dirty = True
+
+    def edit(self, remove, add):
+        """Map page edit mode: remove wrongly explored cells (or restore them with undo). Returns the new epoch."""
+        with self.lock:
+            for k in remove:
+                if k in self.cells:
+                    self.cells.discard(k)
+                    self.area_m2 -= self._cell_area(k % FOG_N)
+            self.order = [k for k in self.order if k in self.cells]
+            for k in add:
+                self._add(k)
+            self.epoch += 1
+            self.dirty = True
+        self.save(force=True)
+        return self.epoch
+
+    def reset(self):
+        with self.lock:
+            self.cells.clear()
+            self.order = []
+            self.area_m2 = 0.0
+            self.prev = None
+            self.epoch += 1
+            self.dirty = True
+        self.save(force=True)
+
+    def since(self, epoch, n):
+        with self.lock:
+            full = epoch != self.epoch or n < 0 or n > len(self.order)
+            cells = list(self.order) if full else self.order[n:]
+            return {"z": FOG_Z, "epoch": self.epoch, "full": full, "n": len(self.order), "cells": cells}
+
+    def summary(self):
+        return {"cells": len(self.order), "km2": round(max(self.area_m2, 0.0) / 1e6, 3), "epoch": self.epoch}
+
+
+fog = None   # created in main()
+
+
+def full_summary():
+    with rec.lock:
+        info = rec.summary()
+    info["fog"] = fog.summary()
+    if update_info:
+        info["update"] = update_info
+    return info
+
+
+def check_update():
+    """One quiet look at the latest GitHub release. Never blocks and never fails loudly (offline, rate limit, ...)."""
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                     headers={"User-Agent": "BNE-LiveGPS", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=4) as r:
+            j = json.loads(r.read(200000).decode("utf-8", "replace"))
+        tag = re.sub(r"[^0-9A-Za-z.\-]", "", str(j.get("tag_name") or ""))[:20]
+        ver = lambda t: tuple(int(p) for p in re.findall(r"\d+", t)[:3])
+        if tag and ver(tag) > ver(VERSION):
+            url = str(j.get("html_url") or "")
+            if not url.startswith("https://github.com/"):
+                url = f"https://github.com/{REPO}/releases/latest"
+            update_info.update(version=tag.lstrip("vV"), url=url)
+            print(f"\n  UPDATE AVAILABLE: v{update_info['version']} (you have v{VERSION})  {url}", flush=True)
+    except Exception:
+        pass
+
+
 rec = None   # created in main()
 
 
@@ -338,9 +511,15 @@ def handle_pose(msg):
     if result in ("pending", "drop"):
         return                                   # not believed (yet): the live position stays where it was
     vx, vy = msg.get("vx") or 0.0, msg.get("vy") or 0.0     # m/s in the local frame: x = east, y = north
+    if result == "jump":
+        fog.cut()                                # a teleport reveals nothing, and is not joined to the old place
+    else:
+        if result == "resume":
+            fog.cut()
+        fog.reveal(msg["lat"], msg["lon"])
     with rec.lock:
         speed = rec.last["v"]          # the checked speed (spikes replaced by the last good value)
-        info = rec.summary()
+    info = full_summary()
     if result == "jump":
         vx = vy = 0.0
     pos = {
@@ -361,6 +540,7 @@ def handle_pose(msg):
         latest.clear()
         latest.update(pos)
     rec.save()
+    fog.save()
     try:
         tmp = OUT_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -461,8 +641,7 @@ class Http(BaseHTTPRequestHandler):
             if "t" in data:
                 data["age"] = round(time.time() - data["t"], 3)   # seconds since the last pose
             else:
-                with rec.lock:
-                    data.update(rec.summary())                     # stats even before the first pose
+                data.update(full_summary())                        # stats even before the first pose
             self._send(200, "application/json", json.dumps(data).encode())
         elif path == "/track":
             q = self._q()
@@ -473,8 +652,14 @@ class Http(BaseHTTPRequestHandler):
             self._send(200, "application/json",
                        json.dumps(rec.track_since(since, q.get("id", "")), separators=(",", ":")).encode())
         elif path == "/stats":
-            with rec.lock:
-                self._send(200, "application/json", json.dumps(rec.summary()).encode())
+            self._send(200, "application/json", json.dumps(full_summary()).encode())
+        elif path == "/fog":
+            q = self._q()
+            try:
+                epoch, n = int(q.get("epoch", "0")), int(q.get("n", "0"))
+            except ValueError:
+                epoch, n = 0, 0
+            self._send(200, "application/json", json.dumps(fog.since(epoch, n), separators=(",", ":")).encode())
         elif path in ("/export.gpx", "/export.kml"):
             kind = path[-3:]
             body = (rec.gpx() if kind == "gpx" else rec.kml()).encode("utf-8")
@@ -491,11 +676,28 @@ class Http(BaseHTTPRequestHandler):
         if path == "/reset":
             rec.reset_trip()
             print("\n  Trip and route reset (odometer kept).", flush=True)
-            with rec.lock:
-                info = rec.summary()
+            info = full_summary()
             with lock:
                 latest.update(info)
             self._send(200, "application/json", json.dumps(info).encode())
+        elif path == "/fog/edit":
+            try:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", "0")), 2_000_000)))
+                lists = []
+                for key in ("remove", "add"):
+                    ks = body.get(key, [])
+                    if not isinstance(ks, list) or len(ks) > FOG_MAX_EDIT or not all(
+                            type(k) is int and 0 <= k < FOG_N * FOG_N for k in ks):
+                        raise ValueError(key)
+                    lists.append(ks)
+            except (ValueError, TypeError, AttributeError):
+                self._send(400, "text/plain", b"Bad request")
+                return
+            self._send(200, "application/json", json.dumps({"epoch": fog.edit(*lists)}).encode())
+        elif path == "/fog/reset":
+            fog.reset()
+            print("\n  Fog of the world reset.", flush=True)
+            self._send(200, "application/json", json.dumps({"epoch": fog.epoch}).encode())
         else:
             self._send(404, "text/plain", b"Not found")
 
@@ -785,6 +987,30 @@ body.obs #awakeHint { display: none !important; }
 /* ---------- OBS / overlay mode ---------- */
 body.obs #top, body.obs #controls, body.obs #recenter, body.obs #waiting, body.obs #stats { display: none !important; }
 body.obs.obs-stats #stats { display: flex !important; }
+
+/* ---------- fog of the world, update notice ---------- */
+#fog { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+#fogBar {
+  position: absolute; z-index: 4; left: 50%; top: calc(var(--edge-t) + 50px); transform: translateX(-50%);
+  display: none; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px;
+  padding: 8px 10px; border-radius: 16px; max-width: calc(100vw - 2 * var(--gap));
+}
+#fogBar b { font-size: 13px; padding: 0 4px; }
+#fogBar .seg { grid-template-columns: repeat(3, 52px); padding: 3px; gap: 3px; }
+#fogBar .seg button { height: 34px; }
+#fogBar .btn { height: 40px; padding: 0 14px; }
+#fogBar .btn.go { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+body.fogedit #fogBar { display: flex; }
+body.fogedit #awakeHint, body.fogedit #updPill, body.fogedit #recenter { display: none !important; }
+#updPill {
+  position: absolute; z-index: 4; left: 50%; top: calc(var(--edge-t) + 50px); transform: translateX(-50%);
+  display: flex; align-items: center; gap: 4px; padding: 4px 4px 4px 14px; border-radius: 999px;
+  font-size: 13px; font-weight: 650; white-space: nowrap; border-color: rgba(61,220,132,.45);
+}
+#updPill a { color: var(--live); text-decoration: none; }
+#updPill button { width: 30px; height: 30px; border-radius: 50%; color: var(--muted); font-size: 18px; line-height: 1; }
+body.upd #awakeHint { top: calc(var(--edge-t) + 96px); }
+body.obs #updPill, body.obs #fogBar { display: none !important; }
 </style>
 </head>
 <body>
@@ -889,6 +1115,16 @@ body.obs.obs-stats #stats { display: flex !important; }
     <p class="note">The route and trip are recorded by the script on your PC, also while this page is closed, and kept until you reset them. GPX works in most GPS apps and Strava-like tools, KML opens in Google Earth.</p>
   </div>
 
+  <div class="sec"><h3>Fog of the world</h3>
+    <div class="row"><label>Fog<small>Places you have not driven through yet stay hidden in a mist</small></label><button class="switch" data-opt="fog" role="switch"></button></div>
+    <p class="note" id="fogInfo"></p>
+    <div class="btns">
+      <button class="btn" id="btnFogEdit">Erase cells</button>
+      <button class="btn warn" id="btnFogReset">Reset fog</button>
+    </div>
+    <p class="note">Every place you really drive through is revealed; teleports and glitches reveal nothing. Erase mode shows the grid and lets you remove cells that were revealed by mistake. Reset fog and Reset trip are separate.</p>
+  </div>
+
   <div class="sec"><h3>Tips</h3>
     <p class="note">Open this page on any device in your Wi-Fi, including iPhone and iPad. For full screen on iPhone: Share → <b>Add to Home Screen</b>. The screen stays on while this page is open (setting below the map options). If it still turns off, tap the map once.</p>
     <p class="note">Stream overlay for OBS (browser source): <code id="obsUrl"></code></p>
@@ -900,6 +1136,13 @@ body.obs.obs-stats #stats { display: flex !important; }
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11V5.5a1.5 1.5 0 0 1 3 0V10"/><path d="M12 10V8.5a1.5 1.5 0 0 1 3 0V11"/><path d="M15 11v-1a1.5 1.5 0 0 1 3 0v4.5a6 6 0 0 1-6 6h-.6a6 6 0 0 1-4.5-2.1L4.3 15a1.5 1.5 0 0 1 2.3-1.9L9 15.5V11"/></svg>
   <span>Tap once to keep screen on</span>
 </button>
+<div id="fogBar" class="glass">
+  <b>Erase mode</b>
+  <div class="seg" id="brushSeg"><button data-b="0">1 cell</button><button data-b="1">7×7</button><button data-b="2">17×17</button></div>
+  <button class="btn" id="fogUndo">Undo</button>
+  <button class="btn go" id="fogDone">Done</button>
+</div>
+<div id="updPill" class="glass hidden"><a id="updLink" target="_blank" rel="noopener">Update available</a><button id="updX" aria-label="Dismiss">×</button></div>
 <div id="toast" class="glass"></div>
 
 <script>
@@ -925,15 +1168,15 @@ body.obs.obs-stats #stats { display: flex !important; }
   const OBS = params.get("obs") === "1";
 
   // ---------------------------------------------------------------- settings (per browser)
-  const DEFAULTS = { style: "dark", cam: "chase", buildings: true, autoZoom: true, trail: true, stats: true, units: "metric", awake: true };
+  const DEFAULTS = { style: "dark", cam: "chase", buildings: true, autoZoom: true, trail: true, stats: true, units: "metric", awake: true, fog: false };
   const store = {
     load() { try { return JSON.parse(localStorage.getItem("bne-map") || "{}"); } catch (e) { return {}; } },
     save(s) { try { localStorage.setItem("bne-map", JSON.stringify(s)); } catch (e) {} },
   };
   const S = Object.assign({}, DEFAULTS, OBS ? {} : store.load());
-  // URL overrides (handy for OBS): ?style=liberty&cam=heading&units=imperial&buildings=0&trail=0&stats=1
+  // URL overrides (handy for OBS): ?style=liberty&cam=heading&units=imperial&buildings=0&trail=0&stats=1&fog=0
   for (const k of ["style", "cam", "units"]) if (params.get(k)) S[k] = params.get(k);
-  for (const k of ["buildings", "autoZoom", "trail", "stats"]) if (params.has(k)) S[k] = params.get(k) !== "0";
+  for (const k of ["buildings", "autoZoom", "trail", "stats", "fog"]) if (params.has(k)) S[k] = params.get(k) !== "0";
   if (!STYLES.find(s => s.id === S.style)) S.style = "dark";
   if (!CAMS.includes(S.cam)) S.cam = "chase";
   const save = () => { if (!OBS) store.save(S); };
@@ -1033,6 +1276,8 @@ body.obs.obs-stats #stats { display: flex !important; }
     if (typeof j.odo_m === "number") trip.odo = j.odo_m;
     if (j.track_id && (j.track_id !== trail.id || j.track_n > trail.n)) loadTrack(j.track_id !== trail.id);
     else if (j.track_id && j.track_n < trail.n) loadTrack(true);
+    if (j.fog) onFogInfo(j.fog);
+    if (j.update) showUpdate(j.update);
   }
 
   // ---------------------------------------------------------------- polling the PC script
@@ -1292,9 +1537,240 @@ body.obs.obs-stats #stats { display: flex !important; }
 
   function setStyle(id) {
     if (S.style === id) return;
-    S.style = id; save();
+    S.style = id; save(); fog.dirty = true;
     map.setStyle(styleOf(id).url, { diff: false });   // full reload -> "style.load" re-adds route + buildings
     renderStyleList();
+  }
+
+  // ---------------------------------------------------------------- fog of the world
+  // The script keeps the explored cells (zoom-20 map tiles, ~25 m). Normal view: a translucent mist with soft edges
+  // over everything not explored yet. Erase mode: grid + explored cells are shown, tap a cell to remove it.
+  const FOG_N = 1048576, FOG_Z = 20, FOG_MIN_PX = 10, FOG_MAX_VERTS = 30000, BRUSH = [0, 3, 8];
+  const fog = { epoch: 0, keys: [], set: new Set(), levels: {}, loading: false, dirty: true, edit: false, brush: 0, undo: [], sig: "", info: null };
+  const fogCv = document.createElement("canvas");
+  fogCv.id = "fog";
+  map.getCanvas().after(fogCv);                      // above the map, below the car marker
+  const fogMask = document.createElement("canvas"), fogBlur = document.createElement("canvas");
+  const xOfLng = lng => (lng + 180) / 360 * FOG_N;
+  const yOfLat = lat => { const sn = Math.sin(clamp(lat, -85.0511, 85.0511) * Math.PI / 180); return (0.5 - Math.log((1 + sn) / (1 - sn)) / (4 * Math.PI)) * FOG_N; };
+  const parentKey = (k, L) => (Math.floor(k / FOG_N) >> L) * FOG_N + ((k % FOG_N) >> L);
+
+  function fogAdd(k) {
+    if (fog.set.has(k)) return;
+    fog.set.add(k); fog.keys.push(k);
+    for (const L in fog.levels) fog.levels[L].add(parentKey(k, +L));
+  }
+  function fogLevel(L) {                              // zoomed far out: cells are merged into bigger ones
+    if (!L) return fog.set;
+    let sset = fog.levels[L];
+    if (!sset) { sset = fog.levels[L] = new Set(); for (const k of fog.keys) sset.add(parentKey(k, L)); }
+    return sset;
+  }
+  async function loadFog() {
+    if (fog.loading) return;
+    fog.loading = true;
+    try {
+      const r = await fetch(`/fog?epoch=${fog.epoch}&n=${fog.keys.length}&_=${Date.now()}`, { cache: "no-store" });
+      const j = await r.json();
+      if (j.full) { fog.set = new Set(); fog.keys = []; fog.levels = {}; }
+      for (const k of j.cells) fogAdd(k);
+      fog.epoch = j.epoch; fog.dirty = true; map.triggerRepaint();
+    } catch (e) {
+    } finally { fog.loading = false; }
+  }
+  function onFogInfo(i) {
+    fog.info = i;
+    $("fogInfo").textContent = `Explored: ${i.km2.toFixed(2)} km² · ${i.cells.toLocaleString()} cells`;
+    if (i.epoch !== fog.epoch || i.cells !== fog.keys.length) loadFog();
+  }
+
+  // Does the map's own matrix agree with map.project? Then we project grid corners ourselves (cheap, and we can
+  // see "behind the camera"); otherwise fall back to map.project.
+  function ownProjectionOk(T) {
+    const m = T && T.pixelMatrix, ws = T && T.worldSize;
+    if (!m || !ws) return false;
+    const c = map.getCenter(), mc = maplibregl.MercatorCoordinate.fromLngLat(c), p = map.project(c);
+    const X = mc.x * ws, Y = mc.y * ws, w = m[3] * X + m[7] * Y + m[15];
+    return w > 0 && Math.abs((m[0] * X + m[4] * Y + m[12]) / w - p.x) < 1.5 && Math.abs((m[1] * X + m[5] * Y + m[13]) / w - p.y) < 1.5;
+  }
+
+  function drawFog() {
+    fog.dirty = false;
+    const show = S.fog || fog.edit;
+    fogCv.style.display = show ? "block" : "none";
+    if (!show) return;
+    const W = map.getCanvas().clientWidth, H = map.getCanvas().clientHeight;
+    if (!W || !H) return;
+    const edit = fog.edit, dark = styleOf(S.style).dark;
+    const FS = edit ? Math.min(window.devicePixelRatio || 1, 2) : 0.5;       // the mist is soft: half resolution is enough
+    const w = Math.ceil(W * FS), h = Math.ceil(H * FS);
+    if (fogCv.width !== w || fogCv.height !== h) { fogCv.width = w; fogCv.height = h; }
+    const ctx = fogCv.getContext("2d");
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = dark ? (edit ? "rgba(8,11,17,.45)" : "rgba(8,11,17,.76)") : (edit ? "rgba(210,216,226,.5)" : "rgba(210,216,226,.82)");
+    ctx.fillRect(0, 0, w, h);
+
+    // which grid cells are on screen (coarser when zoomed out, so there are never more than FOG_MAX_VERTS corners)
+    let b;
+    try { b = map.getBounds(); } catch (e) { return; }
+    if (!(b.getWest() < b.getEast())) return;
+    const cellPx = 512 * Math.pow(2, map.getZoom() - FOG_Z);
+    let L = 0, s, x0, y0, nx, ny;
+    while (L < 18 && cellPx * (1 << L) < FOG_MIN_PX) L++;
+    for (;;) {
+      s = 1 << L;
+      x0 = Math.floor(xOfLng(b.getWest()) / s) - 1;
+      y0 = Math.floor(yOfLat(b.getNorth()) / s) - 1;
+      nx = Math.floor(xOfLng(b.getEast()) / s) + 2 - x0;
+      ny = Math.floor(yOfLat(b.getSouth()) / s) + 2 - y0;
+      if (nx * ny <= FOG_MAX_VERTS || L >= 18) break;
+      L++;
+    }
+    const T = map.transform, own = ownProjectionOk(T);
+    const m = own ? T.pixelMatrix : null, ws = own ? T.worldSize : 0;
+    // a grid point (in cells of this level) -> screen px, or null (behind the camera)
+    const pt = (cx, cy) => {
+      const u = cx * s / FOG_N, v = cy * s / FOG_N;
+      if (own) {
+        const X = u * ws, Y = v * ws, wv = m[3] * X + m[7] * Y + m[15];
+        return wv > 1 ? [(m[0] * X + m[4] * Y + m[12]) / wv, (m[1] * X + m[5] * Y + m[13]) / wv] : null;
+      }
+      const p = map.project(new maplibregl.MercatorCoordinate(u, v, 0).toLngLat());
+      return Math.abs(p.x) < 8 * W && Math.abs(p.y) < 8 * H ? [p.x, p.y] : null;
+    };
+    // explored cells; in normal view each is drawn a little bigger, but only when zoomed out so far that a cell is
+    // ~25 px or less (close up the opening follows the cells exactly; measured on the ground, so it is right when tilted too)
+    const set = fogLevel(L), path = new Path2D(), rows = FOG_N >> L, pad = edit ? 0 : clamp(10 / (cellPx * s) - 0.35, 0, 1);
+    let any = false;
+    for (let j = 0; j < ny; j++) {
+      const yy = y0 + j;
+      if (yy < 0 || yy >= rows) continue;
+      for (let i = 0; i < nx; i++) {
+        if (!set.has((x0 + i) * FOG_N + yy)) continue;
+        const cx = x0 + i, A = pt(cx - pad, yy - pad), B = pt(cx + 1 + pad, yy - pad), C = pt(cx + 1 + pad, yy + 1 + pad), D = pt(cx - pad, yy + 1 + pad);
+        if (!(A && B && C && D)) continue;
+        path.moveTo(A[0], A[1]); path.lineTo(B[0], B[1]); path.lineTo(C[0], C[1]); path.lineTo(D[0], D[1]); path.closePath();
+        any = true;
+      }
+    }
+    if (any) {
+      // soft edges: draw the explored cells into a small mask, blur it there (3x3 box, twice) so neighbouring cells melt
+      // into one smooth opening, scale it up smoothly and cut it out of the mist
+      const soft = edit ? 1 : Math.round(clamp(cellPx * s * 0.08, 3, 10));
+      const mw = Math.ceil(W / soft), mh = Math.ceil(H / soft);
+      for (const c of [fogMask, fogBlur]) if (c.width !== mw || c.height !== mh) { c.width = mw; c.height = mh; }
+      const mx = fogMask.getContext("2d");
+      mx.setTransform(1, 0, 0, 1, 0, 0);
+      mx.clearRect(0, 0, mw, mh);
+      mx.setTransform(1 / soft, 0, 0, 1 / soft, 0, 0);
+      mx.fillStyle = "#fff";
+      mx.fill(path);
+      if (!edit) {
+        let from = fogMask, to = fogBlur;
+        for (let pass = 0; pass < 2; pass++) {
+          const bx = to.getContext("2d");
+          bx.setTransform(1, 0, 0, 1, 0, 0);
+          bx.globalCompositeOperation = "source-over"; bx.globalAlpha = 1; bx.clearRect(0, 0, mw, mh);
+          bx.globalCompositeOperation = "lighter"; bx.globalAlpha = 1 / 9;
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) bx.drawImage(from, dx, dy);
+          bx.globalCompositeOperation = "source-over"; bx.globalAlpha = 1;
+          [from, to] = [to, from];
+        }
+      }
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(fogMask, 0, 0, mw, mh, 0, 0, mw * soft * FS, mh * soft * FS);
+      ctx.globalCompositeOperation = "source-over";
+    }
+    if (edit) {                                       // the grid is only shown in erase mode
+      ctx.setTransform(FS, 0, 0, FS, 0, 0);
+      if (any) { ctx.fillStyle = "rgba(255,122,26,.16)"; ctx.fill(path); }
+      if (L === 0 && cellPx >= 24) {
+        const g = new Path2D();
+        for (let j = 0; j <= ny; j++) { const A = pt(x0, y0 + j), B = pt(x0 + nx, y0 + j); if (A && B) { g.moveTo(A[0], A[1]); g.lineTo(B[0], B[1]); } }
+        for (let i = 0; i <= nx; i++) { const A = pt(x0 + i, y0), B = pt(x0 + i, y0 + ny); if (A && B) { g.moveTo(A[0], A[1]); g.lineTo(B[0], B[1]); } }
+        ctx.lineWidth = 1; ctx.strokeStyle = "rgba(255,255,255,.22)"; ctx.stroke(g);
+        if (any) { ctx.lineWidth = 1.5; ctx.strokeStyle = "rgba(255,122,26,.9)"; ctx.stroke(path); }
+      }
+    }
+  }
+  function fogSig() {
+    const c = map.getCenter(), p = map.getPadding();
+    return [c.lng, c.lat, map.getZoom(), map.getBearing(), map.getPitch(), p.top, p.bottom, p.left, p.right,
+      map.getCanvas().clientWidth, map.getCanvas().clientHeight].join(",");
+  }
+  map.on("render", () => {
+    const sg = fogSig();
+    if (fog.dirty || sg !== fog.sig) { fog.sig = sg; drawFog(); }
+  });
+
+  // erase mode: tap cells to remove them (a wrongly explored stretch), undo brings them back
+  function renderBrush() { for (const b of $("brushSeg").children) b.classList.toggle("on", +b.dataset.b === fog.brush); }
+  function setFogEdit(on) {
+    if (OBS) return;
+    fog.edit = on; fog.undo = [];
+    document.body.classList.toggle("fogedit", on);
+    if (on) { closeSheet(); goFree(); renderBrush(); toast(map.getZoom() < 15.5 ? "Zoom in to erase cells" : "Tap cells to erase them"); }
+    else if (st.hasFix) recenter();
+    fog.dirty = true; map.triggerRepaint();
+  }
+  async function fogEdit(remove, add) {
+    for (const k of remove) fog.set.delete(k);
+    for (const k of add) fog.set.add(k);
+    fog.keys = Array.from(fog.set); fog.levels = {};   // same order as the script: removed ones gone, restored ones at the end
+    fog.dirty = true; map.triggerRepaint();
+    try {
+      const r = await fetch("/fog/edit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove, add }) });
+      fog.epoch = (await r.json()).epoch;
+    } catch (e) { toast("Could not save: PC script not reachable"); fog.epoch = 0; loadFog(); }
+  }
+  map.on("click", e => {
+    if (!fog.edit) return;
+    if (map.getZoom() < 15.5) { toast("Zoom in to erase cells"); return; }
+    const cx = Math.floor(xOfLng(e.lngLat.lng)), cy = Math.floor(yOfLat(e.lngLat.lat)), r = BRUSH[fog.brush], hit = [];
+    for (let i = cx - r; i <= cx + r; i++) for (let j = cy - r; j <= cy + r; j++) if (fog.set.has(i * FOG_N + j)) hit.push(i * FOG_N + j);
+    if (!hit.length) { toast("Nothing explored here"); return; }
+    fog.undo.push({ add: hit }); if (fog.undo.length > 30) fog.undo.shift();
+    fogEdit(hit, []);
+  });
+  let fogResetArmed = 0;
+  async function resetFog(btn) {
+    const now = Date.now();
+    if (now - fogResetArmed > 3000) {
+      fogResetArmed = now; btn.classList.add("armed"); btn.textContent = "Tap again to reset";
+      toast("Tap again to erase the whole explored map");
+      setTimeout(() => { fogResetArmed = 0; btn.classList.remove("armed"); btn.textContent = "Reset fog"; }, 3000);
+      return;
+    }
+    fogResetArmed = 0; btn.classList.remove("armed"); btn.textContent = "Reset fog";
+    try {
+      const r = await fetch("/fog/reset", { method: "POST" });
+      fog.epoch = (await r.json()).epoch;
+      fog.set = new Set(); fog.keys = []; fog.levels = {}; fog.undo = []; fog.dirty = true; map.triggerRepaint();
+      toast("Fog reset");
+    } catch (e) { toast("Reset failed: PC script not reachable"); }
+  }
+
+  // ---------------------------------------------------------------- update notice (the script checks GitHub once on start)
+  let updShown = false;
+  function showUpdate(u) {
+    if (updShown || OBS || !u || !u.version) return;
+    let gone = "";
+    try { gone = localStorage.getItem("bne-upd") || ""; } catch (e) {}
+    if (gone === u.version) return;
+    updShown = true;
+    const a = $("updLink");
+    a.textContent = `Update v${u.version} available`;
+    if (/^https:\/\/github\.com\//.test(u.url || "")) a.href = u.url;
+    $("updPill").classList.remove("hidden");
+    document.body.classList.add("upd");
+    $("updX").onclick = () => {
+      try { localStorage.setItem("bne-upd", u.version); } catch (e) {}
+      $("updPill").classList.add("hidden"); document.body.classList.remove("upd");
+    };
   }
 
   // ---------------------------------------------------------------- camera
@@ -1494,6 +1970,7 @@ body.obs.obs-stats #stats { display: flex !important; }
       const k = sw.dataset.opt; S[k] = !S[k]; save(); renderSwitches();
       if (k === "buildings") { S.buildings = !S.buildings; toggle3d(); return; }
       if (k === "trail") { applyTrail(); trail.dirty = true; }
+      if (k === "fog") { fog.dirty = true; map.triggerRepaint(); }
       if (k === "autoZoom") { zoomOffset = 0; manualZoom = map.getZoom(); }
       if (k === "awake") { if (S.awake) { keepAwake(); toast("Screen stays on"); } else { releaseAwake(); toast("Screen can turn off"); } updateAwakeHint(); }
     };
@@ -1501,6 +1978,11 @@ body.obs.obs-stats #stats { display: flex !important; }
   $("spdBox").onclick = () => { S.units = imperial() ? "metric" : "imperial"; save(); renderSwitches(); renderHud(); toast(spdUnit()); };
   $("btnReset").onclick = e => resetTrip(e.currentTarget);
   $("btnReset2").onclick = e => resetTrip(e.currentTarget);
+  $("btnFogEdit").onclick = () => setFogEdit(true);
+  $("btnFogReset").onclick = e => resetFog(e.currentTarget);
+  $("fogDone").onclick = () => setFogEdit(false);
+  $("fogUndo").onclick = () => { const u = fog.undo.pop(); if (u) fogEdit([], u.add); else toast("Nothing to undo"); };
+  $("brushSeg").onclick = e => { const b = e.target.dataset && e.target.dataset.b; if (b !== undefined) { fog.brush = +b; renderBrush(); } };
 
   // copy coordinates (clipboard API needs HTTPS, so fall back for the Wi-Fi address)
   $("coords").onclick = () => {
@@ -1638,15 +2120,18 @@ def lan_ip():
 
 
 def main():
-    global rec
+    global rec, fog
     rec = Recorder()
-    atexit.register(lambda: rec.save(force=True))
+    fog = Fog()
+    atexit.register(lambda: (rec.save(force=True), fog.save(force=True)))
     try:
         http = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Http)
     except OSError as e:
         print(f"ERROR: port {HTTP_PORT} is already in use ({e}). Is the script already running?")
         return
     threading.Thread(target=http.serve_forever, daemon=True).start()
+    if "--no-update-check" not in sys.argv:
+        threading.Thread(target=check_update, daemon=True).start()
 
     line = "=" * 62
     print(line)
@@ -1663,6 +2148,8 @@ def main():
     print(f"  Total driven:       {rec.odo_m / 1000:.2f} km")
     print(f"  Current trip:       {t['dist_m'] / 1000:.2f} km, {len(rec.points)} route points "
           f"(reset it on the map: Settings > Reset trip)")
+    fs = fog.summary()
+    print(f"  Explored (fog):     {fs['km2']:.2f} km2, {fs['cells']} cells (edit or reset it on the map: Settings > Fog)")
     print(f"  Data folder:        {DATA_DIR}")
     print(line)
     serve_relay()
