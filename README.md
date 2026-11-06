@@ -46,7 +46,7 @@ heading in between so the map moves smoothly.
 ### 1. PC
 
 1. Start the BeamNG.Earth server as usual.
-2. Run `python pc/bne_live_coords.py`
+2. Run `python pc/bne_live_coords[version].py`
    It prints the address for the phone, e.g. `Phone app address:  192.168.178.20:47700`.
    and the live map address, e.g. `Live map (browser): http://192.168.178.20:47700/map`.
    If Windows Firewall asks, allow access on **private networks**.
