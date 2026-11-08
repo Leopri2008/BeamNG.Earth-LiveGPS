@@ -55,6 +55,21 @@ heading in between so the map moves smoothly.
 
 To go back to normal, just remove the launch option.
 
+#### Without the launch option: BeamNG.Earth's companion feed
+
+Newer BeamNG.Earth versions publish the car's position themselves, read-only, on `http://127.0.0.1:47615/v1/stream`
+(the "companion feed"). With one of those, run the script with `--feed` instead of setting up the relay:
+
+```
+python "pc/bne_live_coords v1.3.py" --feed
+```
+
+No `-bngeport` launch option is needed, and nothing sits between the game and the BeamNG.Earth server. The script
+reconnects by itself when BeamNG.Earth restarts. `BNE_FEED=http://host:port` points it at another address.
+
+`--port <number>` serves the phone app and the live map on another port than 47700 (for example when 47700 is taken);
+the phone app's address then ends in that port.
+
 You can also open `http://127.0.0.1:47700/` in a browser, or read `live_position.json`, for your own overlays/tools.
 
 ### 2. Phone
