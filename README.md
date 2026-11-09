@@ -12,6 +12,18 @@ reset them, exports them as **GPX or KML**, and keeps a lifetime **odometer** th
 **Fog of the world (v1.3):** the map is covered in a light mist. Every place you really drive through is revealed and stays
 revealed. Wrongly revealed cells can be erased again in an erase mode with a grid.
 
+**v2.0 Navigation, POIs and more:**
+- The script can read the position straight from BeamNG.Earth's own feed (`--feed`, no launch option needed). Both works
+- **Street and town** you are in are shown on the map.
+- **Search and turn-by-turn navigation** on the map: places, addresses and categories (fuel, charging, food, fast food, café, parking, shops, pharmacy),
+  stops, avoid motorways/tolls/ferries, turn arrows on the route, and the route starts in the direction the car is facing. It works while you drive.
+- **Points of interest with real icons**, thinned out by importance and zoom, switchable by group; the panels adapt to phones, tablets and big screens.
+- **Search along the route:** only places beside the route ahead of you, loaded piece by piece (36 km ahead), with several map-data servers,
+  short timeouts and a **Try again** button instead of endless loading.
+- **Place card** with opening hours (open/closed), phone, website, an Wikipedia photo and short text where OpenStreetMap or Wikipedia have them.
+- **Fuel prices** (cheapest first, local currency) for Germany (own free key), Austria, France, Spain, Italy, Western Australia, Mexico, Sweden, Denmark,
+  Greece, Croatia, Iceland, Slovenia and Romania, with a backup source and the last known prices if a service is down.
+
 **No changes to BeamNG.Earth** (neither the mod nor the server EXE). It only listens in on the position updates
 the mod already sends to its server.
 
@@ -50,8 +62,8 @@ heading in between so the map moves smoothly.
    It prints the address for the phone, e.g. `Phone app address:  192.168.178.20:47700`.
    and the live map address, e.g. `Live map (browser): http://192.168.178.20:47700/map`.
    If Windows Firewall asks, allow access on **private networks**.
-4. Steam → BeamNG.drive → Properties → Launch options: `-bngeport 47614`
-5. Start BeamNG.drive and load BeamNG.Earth. The console shows `Game connected.` and then a `LIVE` line with your coordinates.
+3. Steam → BeamNG.drive → Properties → Launch options: `-bngeport 47614`
+4. Start BeamNG.drive and load BeamNG.Earth. The console shows `Game connected.` and then a `LIVE` line with your coordinates.
 
 To go back to normal, just remove the launch option.
 
@@ -130,6 +142,91 @@ around them, with soft edges.
 - The mist can be switched off in the settings, or in the OBS overlay with `&fog=0`.
 - The explored cells are stored on your PC in `BNE_LiveGPS_data/fog.json`. The settings show how many km² you have explored.
 
+### 6. Trips
+
+The **trips button** on the map (or the key `T`) opens a scrollable list of all your drives, newest first, with distance,
+drive time, average and top speed, and where it started and ended.
+
+- **A trip lasts until you end it:** it keeps running across restarts of the script and pauses of any length, and ends only
+  when you tap *Start new trip* (or reset it). Then it moves to the list and is never overwritten. Drives shorter than 100 m are not kept.
+- **Show on map** draws a finished trip in its own colour (several at once are fine), *Zoom to* flies there, *GPX* exports it,
+  *Delete* removes it for good (tap twice). *Discard* drops the current trip without saving it.
+- Trips are stored in `BNE_LiveGPS_data/trips/`, one file each. The odometer and the fog are not touched by deleting trips.
+- When updating from v1.3: your unfinished v1.3 trip simply continues as the current trip.
+
+### 7. Street and town
+
+The map shows the road and town you are driving through, like the header of a navigation app. The script asks
+OpenStreetMap's free [Nominatim](https://nominatim.org) service for it: at most one request every 4 seconds, only after you
+moved a bit, answers are cached, and a polite User-Agent is sent. **This sends the car's game-world coordinates to
+Nominatim.** Turn it off with `--no-places` (the road and town then disappear from the map, the trips lose their place names).
+
+### 8. Search and navigation
+
+The **search button** on the map (or the key `/`) opens search and navigation. Everything works while you drive too. On a phone it
+is a sheet at the bottom that leaves the map free; on a tablet or desktop it is a panel on the left. The map stays movable all the time.
+
+- **Smart search.** Type a place, an address or a business. The script asks Nominatim twice, once worldwide and once around the car,
+  and ranks the answers by how well known they are **divided by distance**
+- **Categories in any language.** Type *Tankstelle*, *tanken*, *gas station*, *essence*, *gasolinera*, *benzina*, *Apotheke*,
+  *pharmacy*, *Parkplatz*, *Hotel*, ... (many languages) and the category appears as a suggestion while you type. You can add a place:
+  *Gas Station in Hamburg*. The chips under the search field do the same (fuel, charging, food, café, parking, shops, pharmacy,
+  hospital, hotels, ATM, bars, toilets, sights).
+- **Tiles first.** A category is first looked up in the map tiles that are already loaded around the car (instant, **no request at all**).
+  Only when fewer than five are found, or when you tap *Search wider (online)*, Nominatim is asked (one request, 1.1 s apart,
+  cached for 7 days). The list is sorted nearest first and every result is a pin with its own icon and name on the map.
+- **Route here** plans the route from the car and **shows the whole route** next to the panel, so you see where it goes
+  You can **add stops** (search again, tap *Add as stop*: it goes where it
+  costs the least detour, so a gas station on the way becomes the next stop), remove or move them, and choose **Avoid motorways / tolls
+  / ferries**. The summary shows time, distance and arrival time.
+- **Start** shows the next turn with distance at the top, the remaining
+  distance, time and arrival. The route button in the bar shows the whole route again. Drive off the route and it **reroutes by
+  itself**. Reaching a stop moves on to the next one, reaching the destination ends the navigation. A running navigation survives a
+  page reload.
+- **Routing** uses the free public [Valhalla](https://valhalla.github.io/valhalla/) server of OpenStreetMap (FOSSGIS), **search**
+  uses Nominatim. **Both are shared fair-use services with no guarantee.** Everything goes through the script with a pause between
+  requests, a polite User-Agent, and a search cache (`search_cache.json`). **Your search text and the game-world coordinates are
+  sent to those servers.** Turn it all off with `--no-nav`, or use your own routing server with `--router http://127.0.0.1:8002/route`.
+
+#### Search along the route, details and fuel prices
+
+With a route planned or running, the category chips search **along the route**: only places beside the route and ahead of you
+(up to 36 km ahead, within 1.2 km of the road), sorted by how little they are off your way, with "in 19 km · 90 m off route". The switch above the
+chips changes to *Nearby* (around the car). This uses the OpenStreetMap server Overpass (`--no-nav` turns it off).
+
+Tap a place for its card: opening hours with open/closed (judged by the time zone of the place's location),
+phone, website, and, for notable places, a photo and a short text from Wikipedia. Ratings and reviews do not exist in free data and are not shown.
+
+**Fuel prices** (live, shown in the list, on the pins and on the card; the list has the fuel type, "Cheapest first" and a **Cheapest** tag):
+
+| Country | Source | Key |
+|---|---|---|
+| Germany | Tankerkönig (MTS-K, CC BY 4.0) | **your own free key**, see below |
+| Austria | E-Control Spritpreisrechner | none |
+| France | data.economie.gouv.fr | none |
+| Spain | Ministerio para la Transición Ecológica | none |
+| Italy | MIMIT open data (daily snapshot of 08:00, not live) | none |
+| Western Australia | FuelWatch (CC BY 4.0, price of the day) | none |
+| Mexico | CRE (pesos) | none |
+| Sweden, Denmark, Greece, Croatia, Iceland, Slovenia, Romania | [fuel-prices.eu](https://www.fuel-prices.eu/api/docs/) (open mirror, EUR, no key *today*) | none |
+
+**Needs its own free key:** only Germany. **Not built in**
+Italy, Western Australia and Mexico are built from the published formats and not yet verified against the live servers. Everywhere else the list says that there are no prices.
+Features depend on the region: the map, search, routes and symbols work worldwide.
+
+*Key for Germany:* register for free at [creativecommons.tankerkoenig.de](https://creativecommons.tankerkoenig.de) and put the key either into
+the environment variable `TANKERKOENIG_KEY` or into the file `keys.json` in the data folder: `{"tankerkoenig": "your-key"}`.
+The key stays on your PC. It is never sent to the browser, never written into the script and never uploaded to GitHub (the terms forbid
+publishing keys), so nobody can use up your quota through the script; everybody who runs it uses their own key. Tankerkönig allows one
+request per minute; the script asks only when you search for fuel and remembers the answer for 5 minutes.
+
+### 9. Points of interest
+
+Settings → *Navigation & map points* switches **groups** on the map from street level: fuel and charging, food and drink, shops,
+parking, hotels and camping, health, banks/post/toilets, sights and parks. Each point has its own **icon in the colour of its kind**
+(a pump for gas stations, fork and knife for restaurants, a bed for hotels, ...), the name shows when you zoom in. Charging stations, toilets, doctors and similar appear only when you are zoomed in close. Tap one to route there or add it as a stop.
+The default *Avoid …* options are in the same settings section.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -146,8 +243,9 @@ around them, with soft edges.
 ## Notes
 
 - Some apps and games detect mock locations. Games like Pokémon GO ban accounts for it, so don't use it there.
+- On start the script looks **once** for a newer release on GitHub (no personal data is sent, nothing is downloaded or installed)
 - The HTTP endpoint is reachable by anyone on your local network (read-only, position only).
-- - Your route and stats are stored only on your PC, in `BNE_LiveGPS_data` next to the script. Delete that folder to start completely fresh (this also resets the total km).
+- Your route and stats are stored only on your PC, in `BNE_LiveGPS_data` next to the script. Delete that folder to start completely fresh (this also resets the total km).
 - Map data © [OpenFreeMap](https://openfreemap.org), © [OpenMapTiles](https://www.openmaptiles.org/), data from [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors.
   
 ## Credits
@@ -163,19 +261,3 @@ written permission. Please share a link to this repository instead. Full terms: 
 
 If you show it in a video or stream, please credit:
 `BeamNG.Earth Live GPS by Leopri2008 – https://github.com/Leopri2008/BeamNG.Earth-LiveGPS`
-
----
-
-### Kurzanleitung (Deutsch)
-
-1. BeamNG.Earth-Server starten, dann `python pc/bne_live_coords.py`.
-2. In Steam bei BeamNG.drive die Startoption `-bngeport 47614` setzen und das Spiel starten.
-3. APK aus den Releases installieren, in den Entwickleroptionen als „App für Pseudo-Standorte" wählen.
-4. In der App die PC-Adresse aus der Konsole eintragen und auf START tippen. Handy und PC müssen im selben WLAN sein.
-5. Live-Karte (auch iPhone): die `Live map`-Adresse aus der Konsole im Browser öffnen, z. B. `http://192.168.178.20:47700/map`.
-6. Strecke, Trip und Gesamt-km zeichnet das Skript selbst auf (auch bei geschlossenem Browser) und speichert sie im Ordner `BNE_LiveGPS_data`. Export als GPX/KML und Reset in den Karten-Einstellungen.
-7. Nebel der Welt: Orte, durch die du wirklich gefahren bist, werden aufgedeckt und bleiben es. Falsch aufgedeckte Felder lassen sich im Entfernen-Modus (Einstellungen → Fog of the world → *Erase cells*) wieder löschen. Das Skript prüft beim Start einmal, ob es ein Update gibt
-
-Lizenz: Alle Rechte vorbehalten. Private Nutzung ist frei, bei öffentlicher Vorstellung sind Credits Pflicht.
-Weiterverbreitung und kommerzielle Nutzung nur mit schriftlicher Erlaubnis. Details siehe [LICENSE](LICENSE).
-
