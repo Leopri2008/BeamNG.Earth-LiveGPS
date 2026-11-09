@@ -50,6 +50,13 @@ VERSION = "1.3"
 LISTEN_PORT = 47614       # the game connects here (-bngeport 47614)
 SERVER_PORT = 47613       # the BeamNG.Earth server listens here (default)
 HTTP_PORT = 47700         # JSON endpoint for the phone app / your own tools
+if "--port" in sys.argv:  # (another port: BeamNG.Earth's Options tab, or by hand)
+    try:
+        _p = int(sys.argv[sys.argv.index("--port") + 1])
+        if 1024 <= _p <= 65535:
+            HTTP_PORT = _p
+    except (IndexError, ValueError):
+        pass
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_FILE = os.path.join(SCRIPT_DIR, "live_position.json")
 DATA_DIR = os.path.join(SCRIPT_DIR, "BNE_LiveGPS_data")   # route + stats, kept across restarts
@@ -598,6 +605,59 @@ def pipe(src, dst, inspect):
                 s.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+
+FEED_URL = os.environ.get("BNE_FEED", "http://127.0.0.1:47615")   # BeamNG.Earth's companion feed (--feed)
+
+
+def serve_feed(url=None):
+    """--feed: the car's position from BeamNG.Earth's own companion feed (its server, 127.0.0.1:47615/v1/stream,
+    read-only server-sent events, about two poses a second) instead of the relay: no -bngeport launch option, and
+    nothing sits between the game and its server. Reconnects by itself."""
+    import http.client
+    import urllib.parse
+    u = urllib.parse.urlsplit(url or FEED_URL)
+    host, port = u.hostname or "127.0.0.1", u.port or 47615
+    print(f"  Reading the position from BeamNG.Earth's feed ({host}:{port})...")
+    said = False
+    while True:
+        conn = None
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=30)
+            conn.request("GET", "/v1/stream", headers={"Accept": "text/event-stream"})
+            r = conn.getresponse()
+            if r.status != 200:
+                raise OSError(f"HTTP {r.status}")
+            if not said:
+                print("\n  Connected to BeamNG.Earth. Load into the world and drive.", flush=True)
+                said = True
+            while True:
+                line = r.fp.readline(1 << 16)
+                if not line:
+                    raise OSError("the feed closed")
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue                        # (keep-alive comments, blank lines)
+                try:
+                    p = json.loads(line[5:])
+                except ValueError:
+                    continue
+                if not isinstance(p, dict) or not p.get("ok"):
+                    continue
+                msg = {"lat": p.get("lat"), "lon": p.get("lon"), "speed": p.get("speed"), "vx": p.get("ve"),
+                       "vy": p.get("vn"), "anchorId": p.get("anchorId")}
+                try:
+                    handle_pose(msg)
+                except Exception as e:              # never let a bad pose stop the feed
+                    print(f"\n  [warn] pose skipped: {e}", flush=True)
+        except (OSError, http.client.HTTPException) as e:
+            if said:
+                print(f"\n  BeamNG.Earth's feed went away ({e}); trying again...", flush=True)
+                said = False
+            time.sleep(2.0)
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def serve_relay():
@@ -2142,7 +2202,9 @@ def main():
     print(f"  Live map (browser): http://{ip}:{HTTP_PORT}/map")
     print(f"  Local JSON:         http://127.0.0.1:{HTTP_PORT}/")
     print(f"  Export route:       http://{ip}:{HTTP_PORT}/export.gpx  (or .kml)")
-    print(f"  Relay:              game -> :{LISTEN_PORT} -> server :{SERVER_PORT}")
+    feed = "--feed" in sys.argv or bool(os.environ.get("BNE_FEED"))
+    print(f"  Position from:      BeamNG.Earth's feed {FEED_URL}" if feed else
+          f"  Relay:              game -> :{LISTEN_PORT} -> server :{SERVER_PORT}")
     print(line)
     t = rec.trip
     print(f"  Total driven:       {rec.odo_m / 1000:.2f} km")
@@ -2152,7 +2214,10 @@ def main():
     print(f"  Explored (fog):     {fs['km2']:.2f} km2, {fs['cells']} cells (edit or reset it on the map: Settings > Fog)")
     print(f"  Data folder:        {DATA_DIR}")
     print(line)
-    serve_relay()
+    if feed:
+        serve_feed()
+    else:
+        serve_relay()
 
 
 if __name__ == "__main__":
