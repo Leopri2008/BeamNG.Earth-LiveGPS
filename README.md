@@ -1,3 +1,6 @@
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Q0D12ADPNC)
+
+With that you support the creator of the GPS mod. Not Beamng.earth
 # BeamNG.Earth Live GPS
 
 Drive in [BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth), and your **Android phone's GPS follows your car in real time**,
